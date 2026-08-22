@@ -1790,3 +1790,19 @@ Expected: all green; clippy clean. The `crates/persistence` integration test ski
   original plan; added after the Task 2 spec review flagged that the library's new `FailingStore`
   (all operations fail) and a pre-existing test-local `FailingStore` (only `set` fails) would
   otherwise share a name in one file.
+- **Task 4's `modal.rs` end-to-end test uses provider `"local"`, not `"openai"`.** As the plan wrote
+  it the test passed a plain `cargo test` but failed under `OPENAI_API_KEY=sk-test`:
+  `fetch_model_list` reads the *process* environment and has no injection seam, so an ambient key
+  resolves via `KeyResolution::Found`, the store is never consulted, and the fetch escapes to a real
+  network request that returns `Auth` rather than `StoreUnavailable`. `"local"` declares no env var
+  (`env_key_var("local") == None`), so `env_key` cannot answer and only the store can — the same
+  technique the plan already uses with `"ollama"` in
+  `resolve_key_delegates_to_the_process_env_reader`. Every assertion survives verbatim except
+  `contains("openai")` → `contains("local")`; the strict class assertion is kept rather than
+  weakened. This also stops the suite reaching the network on any machine with a provider key
+  exported.
+- **Task 4 also fixed two comment inaccuracies in `modal.rs`** surfaced by the Task 3 quality
+  review: the `ModelsStep::Credentials` doc's "pure function of the step" claim (`models_view`
+  already takes a locale-bearing `ModalContext`), replaced with the real argument — the carried
+  `remedy` follows the sibling `error` field that `app.rs` already precomputes; and the render arm's
+  reference to "the input box", which belongs to `ModelsStep::Manual`, not `Credentials`.
