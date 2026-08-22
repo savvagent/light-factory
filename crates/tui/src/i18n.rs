@@ -189,6 +189,7 @@ const EN: Catalog = &[
     ("provider.key.env", "env"),
     ("provider.key.keyring", "keyring"),
     ("provider.key.none", "none"),
+    ("provider.key.unavailable", "unavailable"),
     ("key.list", "keys: {list}"),
     ("status.model_set", "Model set to {model}"),
     (
@@ -506,6 +507,7 @@ const ES: Catalog = &[
     ("provider.key.env", "entorno"),
     ("provider.key.keyring", "llavero"),
     ("provider.key.none", "ninguna"),
+    ("provider.key.unavailable", "no disponible"),
     ("key.list", "claves: {list}"),
     ("status.model_set", "Modelo cambiado a {model}"),
     (

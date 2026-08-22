@@ -651,8 +651,13 @@ impl App {
                 let connected = if *id == "ollama" {
                     std::env::var("LIGHT_OLLAMA").as_deref() == Ok("1")
                 } else {
-                    crate::selection::key_status(id, self.store.as_ref())
-                        != crate::selection::KeyStatus::None
+                    // `Unavailable` counts as connected here: the store could not be asked, so
+                    // routing to key entry would demand a key the user may already have stored.
+                    // Task 5 gives it its own row state; this keeps the navigation honest now.
+                    !matches!(
+                        crate::selection::key_status(id, self.store.as_ref()),
+                        crate::selection::KeyStatus::None
+                    )
                 };
                 ProviderRow {
                     id: id.to_string(),
@@ -1031,6 +1036,9 @@ impl App {
             crate::selection::KeyStatus::Env => self.t("provider.key.env").to_string(),
             crate::selection::KeyStatus::Keyring => self.t("provider.key.keyring").to_string(),
             crate::selection::KeyStatus::None => self.t("provider.key.none").to_string(),
+            crate::selection::KeyStatus::Unavailable => {
+                self.t("provider.key.unavailable").to_string()
+            }
         }
     }
 
@@ -2056,10 +2064,10 @@ mod tests {
         }
     }
 
-    /// A store whose `set` always fails, for exercising the keyring-failure branch.
-    struct FailingStore;
+    /// A store whose `set` always fails, for exercising the keyring write-failure branch.
+    struct SetFailsStore;
 
-    impl CredentialStore for FailingStore {
+    impl CredentialStore for SetFailsStore {
         fn get(&self, _provider: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
@@ -3730,9 +3738,24 @@ mod tests {
         ));
     }
 
+    /// `/key` must not list a provider as having no key when the store could not be asked.
+    ///
+    /// The assertion is the negative on purpose: `key_status` reads the *process* environment and
+    /// `App` has no injection seam for it, so a developer with `OPENAI_API_KEY` exported gets
+    /// `env` here and anyone else gets `unavailable`. Both are correct; `none` is the defect. The
+    /// strict `KeyStatus::Unavailable` assertion lives in `selection.rs`, where the env is
+    /// injected.
+    #[test]
+    fn the_key_listing_never_reports_an_unreadable_store_as_no_key() {
+        let app = test_app_with_store(Arc::new(
+            light_factory_tui::credentials::FailingStore::default(),
+        ));
+        assert_ne!(app.key_status_label("openai"), app.t("provider.key.none"));
+    }
+
     #[test]
     fn handle_connect_key_keyring_failure_sets_error_and_stays() {
-        let mut app = test_app_with_store(Arc::new(FailingStore));
+        let mut app = test_app_with_store(Arc::new(SetFailsStore));
         open(
             &mut app,
             Modal::Connect(ConnectStep::KeyEntry {

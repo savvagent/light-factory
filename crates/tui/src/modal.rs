@@ -130,8 +130,9 @@ pub(crate) enum ModelsStep {
     ///
     /// `remedy` is already localized and already class-specific: `/connect` and `/key` are the
     /// answer to a missing or rejected key, and are useless against a store that cannot be read,
-    /// so the step carries the sentence rather than deriving it at render time. That keeps the
-    /// render a pure function of the step, as every other arm is.
+    /// so the step carries the sentence rather than deriving it at render time. It also follows
+    /// the sibling `error` field, which `app.rs` already precomputes: the class-based branching
+    /// stays in the one module that owns it.
     Credentials {
         provider: String,
         error: String,
@@ -156,17 +157,6 @@ pub(crate) enum FetchFailure {
     /// The credential store could not be read, so whether a key exists is unknown. Distinct from
     /// [`FetchFailure::MissingKey`]: the remedy for a missing key is to store one, which is not a
     /// remedy for a store that cannot be read.
-    ///
-    /// Nothing outside the tests builds one yet — key resolution still collapses an unreadable
-    /// store into `MissingKey`. `expect` rather than `allow` so that the suppression becomes a
-    /// compile error the moment resolution starts reporting the store failure it hides.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "key resolution does not report an unreadable store yet"
-        )
-    )]
     StoreUnavailable,
 }
 
@@ -706,7 +696,23 @@ async fn fetch_model_list_inner(
     }
     let key = match key_override {
         Some(k) => Some(k),
-        None => crate::selection::resolve_key(provider, store),
+        None => match crate::selection::resolve_key(provider, store) {
+            crate::selection::KeyResolution::Found(k) => Some(k),
+            crate::selection::KeyResolution::Missing => None,
+            crate::selection::KeyResolution::Unavailable(error) => {
+                return Err(FetchError {
+                    class: FetchFailure::StoreUnavailable,
+                    // Our own sentence rather than a remote one, but still capped: the cap is
+                    // what keeps the modal's own remedy rows on screen when the backend is
+                    // verbose.
+                    message: summarize_provider_error(&i18n::t_with(
+                        locale,
+                        "connect.store_unavailable",
+                        &[("provider", provider), ("error", &error)],
+                    )),
+                });
+            }
+        },
     };
     fetch_with_key(provider, key, locale).await
 }
@@ -1143,8 +1149,8 @@ fn models_view(step: &ModelsStep, ctx: &ModalContext<'_>) -> PopupView {
         }
         // Trusted rows first, provider text last. `draw_popup` sizes itself from the wrapped row
         // count, so nothing should be clipped — but if a very short terminal clips anyway, what
-        // survives must be the remedy and the input box rather than the remote-supplied error that
-        // would otherwise have displaced them.
+        // survives must be the remedy rather than the remote-supplied error that would otherwise
+        // have displaced it.
         ModelsStep::Credentials { error, remedy, .. } => {
             lines.push(Line::from(Span::styled(
                 i18n::t(ctx.locale, "models.credentials_hint"),
@@ -2067,6 +2073,31 @@ mod tests {
             "a missing key must route to the credential step"
         );
         assert_eq!(err.message, "No API key for openai");
+    }
+
+    /// End to end through the real seam: an unreadable store produces the store class, not
+    /// `MissingKey`, and the sentence names the store rather than claiming there is no key.
+    ///
+    /// The provider is `local` because it declares no env var (as `selection.rs`'s
+    /// `resolve_key_delegates_to_the_process_env_reader` uses `ollama` for the same reason):
+    /// `fetch_model_list` reads the *process* environment and has no injection seam, so with
+    /// `openai` a developer with `OPENAI_API_KEY` exported would resolve an env key here, escape
+    /// to a real network call, and get `Auth` instead. Keyless means only the store can answer,
+    /// which is exactly the branch under test.
+    #[tokio::test]
+    async fn an_unreadable_store_reports_the_store_failure_not_a_missing_key() {
+        let store = light_factory_tui::credentials::FailingStore::new("no D-Bus session");
+        let err = fetch_model_list("local", None, &store, Locale::En)
+            .await
+            .expect_err("an unreadable store cannot produce a model list");
+        assert_eq!(err.class, FetchFailure::StoreUnavailable);
+        assert!(err.message.contains("local"), "{}", err.message);
+        assert!(err.message.contains("no D-Bus session"), "{}", err.message);
+        assert!(
+            !err.message.contains("No API key"),
+            "the store failure must not be reported as a missing key: {}",
+            err.message
+        );
     }
 
     /// A store failure is a credential-class failure: no model id repairs a credential store, so

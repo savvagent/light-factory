@@ -10,6 +10,7 @@ use light_factory_tui::credentials::CredentialStore;
 
 use crate::provider::ProviderInfo;
 use crate::settings::Settings;
+use crate::text::one_line;
 
 /// The remote provider ids, in key-precedence order.
 pub const REMOTE_IDS: [&str; 4] = ["anthropic", "openai", "gemini", "deepseek"];
@@ -20,17 +21,6 @@ pub fn takes_key(provider: &str) -> bool {
     env_key_var(provider).is_some()
 }
 
-/// Pure classification of a provider's key source.
-fn classify(env_key: Option<String>, keyring_key: Option<String>) -> KeyStatus {
-    if env_key.as_ref().is_some_and(|k| !k.is_empty()) {
-        KeyStatus::Env
-    } else if keyring_key.is_some() {
-        KeyStatus::Keyring
-    } else {
-        KeyStatus::None
-    }
-}
-
 /// Read a named environment variable. The only place this module touches the real environment:
 /// the public [`key_status`] and [`resolve_key`] pass it to their `_with` forms, and tests pass a
 /// stub instead.
@@ -38,37 +28,84 @@ fn process_env(var: &str) -> Option<String> {
     std::env::var(var).ok()
 }
 
-/// The env key and keyring key for a provider, resolved independently. `env` supplies the value
-/// of a named environment variable; tests pass a stub so the ambient environment cannot decide
-/// the outcome.
-fn sources_with(
-    provider: &str,
-    store: &dyn CredentialStore,
-    env: impl Fn(&str) -> Option<String>,
-) -> (Option<String>, Option<String>) {
-    let env_key = env_key_var(provider).and_then(env);
-    let keyring_key = store.get(provider).ok().flatten();
-    (env_key, keyring_key)
+/// The env-supplied key for `provider`, if the environment supplies a usable one.
+///
+/// An empty value is treated as absent, so the connect flow never fetches with an empty key. This
+/// is the single statement of that rule — the deleted `classify`/`resolve_key_from` pair stated
+/// it twice.
+fn env_key(provider: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    env_key_var(provider)
+        .and_then(env)
+        .filter(|k| !k.is_empty())
 }
 
-/// Where a provider's key comes from, for the `/key` listing.
+/// The store's answer for `provider`, with a failure reduced to one display-ready line.
+///
+/// `{:#}` keeps anyhow's source chain, so the cause (no D-Bus session, a locked wallet) survives
+/// rather than only the outermost "failed". [`one_line`] strips control characters because this
+/// text is written into a terminal cell, where a raw `ESC` is an escape-sequence injection. The
+/// length cap belongs to the modal, which already owns it.
+fn read_store(provider: &str, store: &dyn CredentialStore) -> Result<Option<String>, String> {
+    store.get(provider).map_err(|e| one_line(&format!("{e:#}")))
+}
+
+/// Where a provider's key comes from, for the `/key` listing and the `/connect` rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyStatus {
     Env,
     Keyring,
+    /// No key is stored, and the environment supplies none.
     None,
+    /// The credential store could not be read, so whether a key exists is unknown. Distinct from
+    /// [`KeyStatus::None`] on purpose: the remedy for `None` is to store a key, which is not a
+    /// remedy for a store that cannot be read.
+    Unavailable,
 }
 
-/// A provider's key source against an explicit environment. Lets the wiring (`env_key_var`
-/// naming, `store.get`, and the order the two reach [`classify`]) be tested without the process
-/// env deciding the result.
+/// A resolved API key, or why there is none.
+///
+/// The point of the type is the distinction between [`KeyResolution::Missing`] and
+/// [`KeyResolution::Unavailable`]: the first has a remedy the user can act on (store a key), the
+/// second does not, and reporting the second as the first is the defect this replaces.
+#[derive(Clone, PartialEq, Eq)]
+pub enum KeyResolution {
+    Found(String),
+    Missing,
+    /// The store could not be read; the payload is one display-ready line naming the cause.
+    Unavailable(String),
+}
+
+impl std::fmt::Debug for KeyResolution {
+    /// Redacts the key. `Found` holds a live credential, and a `{:?}` at a future call site — a
+    /// `dbg!`, a `tracing` field, an assertion message — would otherwise print it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyResolution::Found(_) => f.write_str("Found(<redacted>)"),
+            KeyResolution::Missing => f.write_str("Missing"),
+            KeyResolution::Unavailable(error) => f.debug_tuple("Unavailable").field(error).finish(),
+        }
+    }
+}
+
+/// A provider's key source against an explicit environment. Lets the wiring be tested without the
+/// process env deciding the result.
+///
+/// The store is consulted only when the environment did not answer, which is what keeps
+/// [`KeyStatus::Unavailable`] meaningful: a working `OPENAI_API_KEY` must not be reported as
+/// unavailable because the keyring is down.
 fn key_status_with(
     provider: &str,
     store: &dyn CredentialStore,
     env: impl Fn(&str) -> Option<String>,
 ) -> KeyStatus {
-    let (env_key, keyring_key) = sources_with(provider, store, env);
-    classify(env_key, keyring_key)
+    if env_key(provider, env).is_some() {
+        return KeyStatus::Env;
+    }
+    match read_store(provider, store) {
+        Ok(Some(_)) => KeyStatus::Keyring,
+        Ok(None) => KeyStatus::None,
+        Err(_) => KeyStatus::Unavailable,
+    }
 }
 
 /// Classify a provider's key source without revealing the value.
@@ -76,30 +113,25 @@ pub fn key_status(provider: &str, store: &dyn CredentialStore) -> KeyStatus {
     key_status_with(provider, store, process_env)
 }
 
-/// Resolve a provider's API key: env wins over keyring; an empty env value is treated as absent
-/// (mirrors `classify`'s empty-string rule) so the connect flow never fetches with an empty key.
-/// Pure so it is unit-testable without the process env.
-fn resolve_key_from(env_key: Option<String>, keyring_key: Option<String>) -> Option<String> {
-    if let Some(key) = env_key.filter(|k| !k.is_empty()) {
-        Some(key)
-    } else {
-        keyring_key
-    }
-}
-
-/// The resolved API key for a provider against an explicit environment. Lets the wiring
-/// (`env_key_var` naming plus `store.get`) be tested without the process env deciding the result.
+/// The resolved API key for a provider against an explicit environment: env wins over the store,
+/// and the store is consulted only when the env has no usable key.
 fn resolve_key_with(
     provider: &str,
     store: &dyn CredentialStore,
     env: impl Fn(&str) -> Option<String>,
-) -> Option<String> {
-    let (env_key, keyring_key) = sources_with(provider, store, env);
-    resolve_key_from(env_key, keyring_key)
+) -> KeyResolution {
+    if let Some(key) = env_key(provider, env) {
+        return KeyResolution::Found(key);
+    }
+    match read_store(provider, store) {
+        Ok(Some(key)) => KeyResolution::Found(key),
+        Ok(None) => KeyResolution::Missing,
+        Err(error) => KeyResolution::Unavailable(error),
+    }
 }
 
-/// The resolved API key for a provider (env over keyring), or `None` when no key is available.
-pub fn resolve_key(provider: &str, store: &dyn CredentialStore) -> Option<String> {
+/// The resolved API key for a provider (env over store), or why there is none.
+pub fn resolve_key(provider: &str, store: &dyn CredentialStore) -> KeyResolution {
     resolve_key_with(provider, store, process_env)
 }
 
@@ -158,6 +190,7 @@ pub fn rebuild(
 mod tests {
     use super::*;
     use light_factory_providers::SelectedBy;
+    use light_factory_tui::credentials::FailingStore;
     use light_factory_tui::credentials::MemStore;
 
     fn settings(provider: Option<&str>) -> Settings {
@@ -169,17 +202,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_distinguishes_env_keyring_and_none() {
-        assert_eq!(classify(Some("k".to_string()), None), KeyStatus::Env);
-        assert_eq!(
-            classify(Some(String::new()), Some("k".to_string())),
-            KeyStatus::Keyring
-        );
-        assert_eq!(classify(None, Some("k".to_string())), KeyStatus::Keyring);
-        assert_eq!(classify(None, None), KeyStatus::None);
-    }
-
-    #[test]
     fn non_remote_providers_have_no_key() {
         let store = MemStore::new();
         assert_eq!(key_status("ollama", &store), KeyStatus::None);
@@ -187,98 +209,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_key_from_prefers_env_over_keyring() {
+    fn env_key_treats_an_empty_value_as_absent() {
         assert_eq!(
-            resolve_key_from(Some("env".to_string()), Some("ring".to_string())),
-            Some("env".to_string())
-        );
-        assert_eq!(
-            resolve_key_from(None, Some("ring".to_string())),
-            Some("ring".to_string())
-        );
-        assert_eq!(resolve_key_from(None, None), None);
-    }
-
-    #[test]
-    fn resolve_key_from_treats_an_empty_env_value_as_absent() {
-        assert_eq!(
-            resolve_key_from(Some(String::new()), Some("ring".to_string())),
-            Some("ring".to_string())
-        );
-        assert_eq!(resolve_key_from(Some(String::new()), None), None);
-    }
-
-    /// The env stub is supplied explicitly so an ambient `OPENAI_API_KEY` cannot decide the
-    /// outcome; the process env is not read.
-    #[test]
-    fn resolve_key_reads_a_stored_keyring_key() {
-        let unset = |_: &str| None;
-        let store = MemStore::new();
-        store.set("openai", "sk-ring").unwrap();
-        assert_eq!(
-            resolve_key_with("openai", &store, unset),
-            Some("sk-ring".to_string())
-        );
-        assert_eq!(resolve_key_with("openai", &MemStore::new(), unset), None);
-    }
-
-    #[test]
-    fn resolve_key_reads_the_env_var_the_provider_declares() {
-        let store = MemStore::new();
-        store.set("openai", "sk-ring").unwrap();
-        let only_openai = |var: &str| (var == "OPENAI_API_KEY").then(|| "sk-env".to_string());
-        assert_eq!(
-            resolve_key_with("openai", &store, only_openai),
+            env_key("openai", |_| Some("sk-env".to_string())),
             Some("sk-env".to_string())
         );
+        assert_eq!(env_key("openai", |_| Some(String::new())), None);
+        assert_eq!(env_key("openai", |_| None), None);
     }
 
     /// `env_key_var` yields no name for a provider with no declared var, so the reader is never
-    /// invoked at all — the counting stub proves it, not just that the keyring value wins.
+    /// invoked at all — the counting stub proves it.
     #[test]
-    fn resolve_key_never_reads_the_env_for_a_provider_with_no_declared_var() {
-        let store = MemStore::new();
-        store.set("ollama", "sk-ring").unwrap();
+    fn env_key_never_reads_the_env_for_a_provider_with_no_declared_var() {
         let reads = std::cell::Cell::new(0u32);
         let counting = |_: &str| {
             reads.set(reads.get() + 1);
             Some("sk-env".to_string())
         };
-        assert_eq!(
-            resolve_key_with("ollama", &store, counting),
-            Some("sk-ring".to_string())
-        );
+        assert_eq!(env_key("ollama", counting), None);
         assert_eq!(reads.get(), 0);
     }
 
-    /// The empty-env-value rule holds through the `sources_with` wiring, not only in the pure
-    /// `resolve_key_from`.
+    /// The store's error text is what the user reads, so it must survive the seam, on one line.
     #[test]
-    fn resolve_key_with_treats_an_empty_env_value_as_absent() {
-        let store = MemStore::new();
-        store.set("openai", "sk-ring").unwrap();
+    fn read_store_reduces_a_failure_to_one_line() {
+        let store = FailingStore::new("locked wallet\nsecond line");
         assert_eq!(
-            resolve_key_with("openai", &store, |_| Some(String::new())),
-            Some("sk-ring".to_string())
+            read_store("openai", &store),
+            Err("locked wallet".to_string())
         );
     }
 
-    /// The public entry point, deterministic under any ambient environment: `ollama` declares no
-    /// env var, so `process_env` is never consulted and only the keyring can answer.
-    #[test]
-    fn resolve_key_delegates_to_the_process_env_reader() {
-        let store = MemStore::new();
-        store.set("ollama", "sk-ring").unwrap();
-        assert_eq!(resolve_key("ollama", &store), Some("sk-ring".to_string()));
-    }
-
-    /// All four wiring outcomes of `key_status`, which also pins the order the two sources reach
-    /// `classify`: an env-supplied key with an empty store must report `Env`, never `Keyring`.
+    /// All four wiring outcomes of `key_status`, including the one `MemStore` could never reach.
     #[test]
     fn key_status_with_classifies_every_wiring_outcome() {
         let empty = MemStore::new();
         let ring = MemStore::new();
         ring.set("openai", "sk-ring").unwrap();
+        let broken = FailingStore::default();
         let set = |_: &str| Some("sk-env".to_string());
         let blank = |_: &str| Some(String::new());
         let unset = |_: &str| None;
@@ -287,6 +256,100 @@ mod tests {
         assert_eq!(key_status_with("openai", &ring, blank), KeyStatus::Keyring);
         assert_eq!(key_status_with("openai", &ring, unset), KeyStatus::Keyring);
         assert_eq!(key_status_with("openai", &empty, unset), KeyStatus::None);
+        assert_eq!(
+            key_status_with("openai", &broken, unset),
+            KeyStatus::Unavailable,
+            "a store that cannot answer is not the same as a store with no key"
+        );
+    }
+
+    /// A working environment variable must not be reported as unavailable because the keyring is
+    /// down — the store is not consulted at all once the env has answered.
+    #[test]
+    fn an_env_key_wins_over_a_broken_store() {
+        let broken = FailingStore::default();
+        let set = |_: &str| Some("sk-env".to_string());
+        assert_eq!(key_status_with("openai", &broken, set), KeyStatus::Env);
+        let KeyResolution::Found(key) = resolve_key_with("openai", &broken, set) else {
+            panic!("an env key must resolve even when the store is broken");
+        };
+        assert_eq!(key, "sk-env");
+    }
+
+    #[test]
+    fn resolve_key_with_prefers_env_over_the_keyring() {
+        let store = MemStore::new();
+        store.set("openai", "sk-ring").unwrap();
+        let only_openai = |var: &str| (var == "OPENAI_API_KEY").then(|| "sk-env".to_string());
+        let KeyResolution::Found(key) = resolve_key_with("openai", &store, only_openai) else {
+            panic!("expected a resolved key");
+        };
+        assert_eq!(key, "sk-env");
+    }
+
+    /// The env stub is supplied explicitly so an ambient `OPENAI_API_KEY` cannot decide the
+    /// outcome; the process env is not read.
+    #[test]
+    fn resolve_key_with_reads_a_stored_keyring_key() {
+        let unset = |_: &str| None;
+        let store = MemStore::new();
+        store.set("openai", "sk-ring").unwrap();
+        let KeyResolution::Found(key) = resolve_key_with("openai", &store, unset) else {
+            panic!("expected a resolved key");
+        };
+        assert_eq!(key, "sk-ring");
+        assert_eq!(
+            resolve_key_with("openai", &MemStore::new(), unset),
+            KeyResolution::Missing
+        );
+    }
+
+    /// The empty-env-value rule holds through the wiring, not only inside `env_key`.
+    #[test]
+    fn resolve_key_with_treats_an_empty_env_value_as_absent() {
+        let store = MemStore::new();
+        store.set("openai", "sk-ring").unwrap();
+        let KeyResolution::Found(key) = resolve_key_with("openai", &store, |_| Some(String::new()))
+        else {
+            panic!("expected the keyring value");
+        };
+        assert_eq!(key, "sk-ring");
+    }
+
+    /// The distinction the whole change exists for: a store that fails is not a store with no
+    /// key, and the failure's text survives to the caller.
+    #[test]
+    fn resolve_key_with_reports_a_store_failure_rather_than_a_miss() {
+        let broken = FailingStore::new("no D-Bus session");
+        assert_eq!(
+            resolve_key_with("openai", &broken, |_| None),
+            KeyResolution::Unavailable("no D-Bus session".to_string())
+        );
+    }
+
+    /// The public entry point, deterministic under any ambient environment: `ollama` declares no
+    /// env var, so `process_env` is never consulted and only the store can answer.
+    #[test]
+    fn resolve_key_delegates_to_the_process_env_reader() {
+        let store = MemStore::new();
+        store.set("ollama", "sk-ring").unwrap();
+        let KeyResolution::Found(key) = resolve_key("ollama", &store) else {
+            panic!("expected the stored key");
+        };
+        assert_eq!(key, "sk-ring");
+    }
+
+    /// A live key must never reach a log, an assertion message, or a `dbg!`.
+    #[test]
+    fn a_resolved_key_is_redacted_in_debug_output() {
+        let rendered = format!("{:?}", KeyResolution::Found("sk-secret".to_string()));
+        assert!(!rendered.contains("sk-secret"), "{rendered}");
+        assert_eq!(rendered, "Found(<redacted>)");
+        assert_eq!(format!("{:?}", KeyResolution::Missing), "Missing");
+        assert!(
+            format!("{:?}", KeyResolution::Unavailable("locked".to_string())).contains("locked"),
+            "the failure text is not a secret and must stay visible"
+        );
     }
 
     #[test]
