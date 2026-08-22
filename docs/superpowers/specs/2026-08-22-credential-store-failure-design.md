@@ -66,6 +66,8 @@ it is in scope here.
 - A `FetchFailure::StoreUnavailable` class and its `/models` message (`crates/tui/src/modal.rs`).
 - The `/key` listing label, the `/connect` provider-row state, and the engine-pane offline notice
   (`app.rs`, `modal.rs`, `provider.rs`).
+- A private `crates/tui/src/text.rs` holding the one-line/truncate helpers both the resolution seam
+  and the modal need (§4.1).
 - EN + ES catalog entries for every new string.
 
 **Out:**
@@ -125,6 +127,23 @@ backend error's outermost message alone ("failed") would hide the cause. `one_li
 characters and keeps the first line: a keyring backend's error text reaches a terminal cell, and a
 raw `ESC` in a cell is an escape-sequence injection. Length is bounded separately, at the modal
 boundary (§6), which already owns that cap.
+
+`one_line` does not exist yet, and the "one place" justification above only holds if it is not
+written twice. It lands in a new private module, `crates/tui/src/text.rs` (`mod text;` in
+`main.rs`), holding the two text-hygiene rules the TUI needs:
+
+```rust
+/// The first line of `s`, with control characters removed and the ends trimmed.
+pub(crate) fn one_line(s: &str) -> String;
+/// `s` truncated to `max` characters, with an ellipsis when it was truncated.
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String;
+```
+
+`summarize_provider_error` (`modal.rs:608-622`) is reduced to
+`truncate_chars(&one_line(message), PROVIDER_ERROR_MAX_CHARS)` — same behaviour, same tests, and
+the strip rule now has exactly one implementation for `read_store` to share. `text.rs` owns the
+unit tests for both helpers; `summarize_provider_error`'s existing tests stay where they are and
+keep guarding the composition.
 
 The store is consulted **only when the environment did not answer**:
 
@@ -238,6 +257,12 @@ already carries the Ctrl+R retry that a transient D-Bus failure needs.
 | `Missing` | `FetchFailure::MissingKey`, `connect.no_key` — unchanged |
 | `Unavailable(e)` | `FetchFailure::StoreUnavailable`, `connect.store_unavailable` interpolating `provider` and the summarized `e` |
 
+`App::fetch_error_message` (`app.rs:864-872`) matches `FetchFailure` exhaustively and decides
+whether a class's text is wrapped or passed through. `StoreUnavailable` is **passthrough**, like
+`MissingKey`: `connect.store_unavailable` already names the provider and the cause, so wrapping it
+in `connect.fetch_error` would read "Couldn't fetch models: the credential store for openai could
+not be read: ...".
+
 `fetch_with_key` keeps its `Option<String>` signature and its `MissingKey` arm; the new arm is
 produced before it, so the "no key" sentence still has exactly one source. The store error passes
 through `summarize_provider_error` so `FetchError::message`'s documented invariant — one bounded
@@ -344,6 +369,14 @@ The offline line is substituted only when the substitution is true:
   alternative — a second bool — makes an impossible state representable.
 - **`ModelsStep::Credentials` gains a field**, so every construction and pattern match in
   `modal.rs` moves. Same containment; the compiler is exhaustive here.
+- **`ProviderInfo` gains a field**, so every struct-literal construction moves: `selection.rs:139`,
+  the `provider.rs` test helper (`74-82`), and several `app.rs` test helpers. Compiler-exhaustive,
+  same as the two above.
+- **The new `/connect` row suffix is not covered by a width test.**
+  `every_footer_fits_the_popup_in_both_locales` (`i18n.rs`) gates `*.footer` keys only, so a
+  too-long ES `connect.store_unavailable_row` would silently truncate inside the 58-column popup.
+  Mitigated by keeping the string short and adding a test that the longest provider id plus the
+  suffix fits `INNER_WIDTH` in both locales.
 - **The credentials step's remedy becomes data rather than a constant.** A future class that
   forgets to set it would render an empty remedy line. Mitigated by building the step from the
   class in one place, with a test per class asserting a non-empty remedy.
