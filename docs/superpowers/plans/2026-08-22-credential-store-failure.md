@@ -1085,10 +1085,7 @@ rather than incidental:
 - [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p light-factory-tui`
-Expected: PASS — every new test plus all pre-existing ones. If
-`resolve_key_never_reads_the_env_for_a_provider_with_no_declared_var` still exists in its old form
-it was replaced in Step 1 by `env_key_never_reads_the_env_for_a_provider_with_no_declared_var`;
-confirm no duplicate remains.
+Expected: PASS — every new test plus all pre-existing ones.
 
 Also run, as the #49 acceptance criterion this change must not regress:
 `OPENAI_API_KEY=sk-test cargo test -p light-factory-tui`
@@ -1452,6 +1449,11 @@ Add to `crates/tui/src/selection.rs`'s `mod tests`:
 
     /// `rebuild` is the startup entry point; the failures have to survive it or nothing can
     /// render them.
+    /// `build_selection` starts from `selection_from_env()`, so a developer with all four of
+    /// `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`GEMINI_API_KEY`/`DEEPSEEK_API_KEY` exported would see
+    /// every provider skipped before the store is read and no failure recorded. That is the same
+    /// ambient-env caveat the App-level tests carry; the injected-env assertions live in
+    /// `apply_preferences_reports_a_store_failure_for_every_remote_provider` above.
     #[test]
     fn rebuild_carries_store_failures_into_the_provider_info() {
         let broken = FailingStore::default();
@@ -1729,11 +1731,11 @@ In `crates/tui/src/app.rs`, `enter_engine` currently reads:
 ```
 
 Replace **only the loop and the `if let`** (lines 333-339) — `self.engine_log.clear()` on line 332
-stays, or the engine log accumulates across re-entries:
+stays, or the engine log accumulates across re-entries. The result reads:
 
 ```rust
-        self.engine_log.clear();
-        self.engine_log.extend(info.notices(self.config.lang));
+        self.engine_log.clear();                                  // line 332, unchanged
+        self.engine_log.extend(info.notices(self.config.lang));   // replaces 333-339
 ```
 
 Add `store_failures: Vec::new(),` to the `ProviderInfo` literal in `test_app_with_store`.
