@@ -604,21 +604,10 @@ const PROVIDER_ERROR_MAX_CHARS: usize = 120;
 /// it fills the modal body and pushes the modal's own trusted rows — the remedy, and on the manual
 /// step the input box — past the bottom of the screen, which turns a model picker into a
 /// credential-phishing surface. Control characters go too: a raw `ESC` written into a terminal
-/// cell is an escape-sequence injection.
+/// cell is an escape-sequence injection. The two rules it composes live in [`crate::text`] so the
+/// credential-store path can share them.
 fn summarize_provider_error(message: &str) -> String {
-    let first: String = message
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
-    let first = first.trim();
-    if first.chars().count() <= PROVIDER_ERROR_MAX_CHARS {
-        return first.to_string();
-    }
-    let kept: String = first.chars().take(PROVIDER_ERROR_MAX_CHARS).collect();
-    format!("{kept}\u{2026}")
+    crate::text::truncate_chars(&crate::text::one_line(message), PROVIDER_ERROR_MAX_CHARS)
 }
 
 /// Classify a provider's fetch error and bound its text. The single place remote error text
