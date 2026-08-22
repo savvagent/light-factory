@@ -30,9 +30,9 @@ fn process_env(var: &str) -> Option<String> {
 
 /// The env-supplied key for `provider`, if the environment supplies a usable one.
 ///
-/// An empty value is treated as absent, so the connect flow never fetches with an empty key. This
-/// is the single statement of that rule — the deleted `classify`/`resolve_key_from` pair stated
-/// it twice.
+/// An empty value is treated as absent, so the connect flow never fetches with an empty key. Both
+/// [`key_status_with`] and [`resolve_key_with`] go through here, so the rule has one source of
+/// truth rather than being restated at each of them.
 fn env_key(provider: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
     env_key_var(provider)
         .and_then(env)

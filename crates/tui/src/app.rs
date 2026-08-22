@@ -35,7 +35,7 @@ use crate::config::Config;
 use crate::modal::fetch_error;
 use crate::modal::{
     ConnectStep, FetchError, FetchFailure, FetchSink, Modal, ModalApply, ModalContext, ModalHost,
-    ModalTransition, ModelsStep, ProviderRow, fetch_model_list, mask,
+    ModalTransition, ModelsStep, ProviderRow, RowKey, fetch_model_list, mask,
 };
 use crate::provider::ProviderInfo;
 use crate::selection::takes_key;
@@ -648,20 +648,26 @@ impl App {
         PROVIDER_NAMES
             .iter()
             .map(|id| {
-                let connected = if *id == "ollama" {
-                    std::env::var("LIGHT_OLLAMA").as_deref() == Ok("1")
+                let key = if *id == "ollama" {
+                    // Ollama takes no API key; `LIGHT_OLLAMA` is the whole of its configuration,
+                    // so the credential store is never consulted for it.
+                    if std::env::var("LIGHT_OLLAMA").as_deref() == Ok("1") {
+                        RowKey::Present
+                    } else {
+                        RowKey::Absent
+                    }
                 } else {
-                    // `Unavailable` counts as connected here: the store could not be asked, so
-                    // routing to key entry would demand a key the user may already have stored.
-                    // Task 5 gives it its own row state; this keeps the navigation honest now.
-                    !matches!(
-                        crate::selection::key_status(id, self.store.as_ref()),
-                        crate::selection::KeyStatus::None
-                    )
+                    match crate::selection::key_status(id, self.store.as_ref()) {
+                        crate::selection::KeyStatus::Env | crate::selection::KeyStatus::Keyring => {
+                            RowKey::Present
+                        }
+                        crate::selection::KeyStatus::None => RowKey::Absent,
+                        crate::selection::KeyStatus::Unavailable => RowKey::Unavailable,
+                    }
                 };
                 ProviderRow {
                     id: id.to_string(),
-                    connected,
+                    key,
                 }
             })
             .collect()
@@ -1990,7 +1996,7 @@ mod tests {
 
     use super::{
         ApiError, App, ConnectStep, EngineForward, FetchError, FetchFailure, FetchSink, KeyCommand,
-        Modal, Mode, ModelsStep, ProviderRow, Session, UiEvent, engine_approval_key,
+        Modal, Mode, ModelsStep, ProviderRow, RowKey, Session, UiEvent, engine_approval_key,
         engine_forward_step, fetch_error, parse_ask_command, parse_connect_command,
         parse_key_command, parse_model_command, parse_models_command,
     };
@@ -2897,7 +2903,7 @@ mod tests {
             Modal::Connect(ConnectStep::ModelList {
                 rows: vec![ProviderRow {
                     id: "openai".to_string(),
-                    connected: true,
+                    key: RowKey::Present,
                 }],
                 provider: "openai".to_string(),
                 models: vec![],
@@ -3167,7 +3173,7 @@ mod tests {
             Modal::Connect(ConnectStep::ProviderList {
                 rows: vec![ProviderRow {
                     id: "local".to_string(),
-                    connected: true,
+                    key: RowKey::Present,
                 }],
                 selected: 0,
             }),
@@ -3751,6 +3757,35 @@ mod tests {
             light_factory_tui::credentials::FailingStore::default(),
         ));
         assert_ne!(app.key_status_label("openai"), app.t("provider.key.none"));
+    }
+
+    /// An unreadable store must not render a provider as though no key were stored — that is the
+    /// row state that routes Enter to key entry.
+    ///
+    /// Negative assertion for the same reason as `the_key_listing_never_reports_...`: with
+    /// `OPENAI_API_KEY` exported this row is `Present`, without it `Unavailable`. `Absent` is the
+    /// defect. `RowKey::Unavailable` itself is pinned in `modal.rs`'s transition tests.
+    #[test]
+    fn provider_rows_never_report_an_unreadable_store_as_having_no_key() {
+        let app = test_app_with_store(Arc::new(
+            light_factory_tui::credentials::FailingStore::default(),
+        ));
+        let rows = app.build_provider_rows();
+        let openai = rows
+            .iter()
+            .find(|r| r.id == "openai")
+            .expect("openai is a listed provider");
+        assert_ne!(openai.key, RowKey::Absent);
+    }
+
+    #[test]
+    fn provider_rows_report_a_stored_key_as_present() {
+        let store = MemStore::new();
+        store.set("openai", "sk-ring").unwrap();
+        let app = test_app_with_store(Arc::new(store));
+        let rows = app.build_provider_rows();
+        let openai = rows.iter().find(|r| r.id == "openai").expect("listed");
+        assert_eq!(openai.key, RowKey::Present);
     }
 
     #[test]

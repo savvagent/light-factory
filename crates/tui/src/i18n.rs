@@ -265,6 +265,7 @@ const EN: Catalog = &[
     ("connect.title", "Connect a provider"),
     ("connect.key_heading", "API Key"),
     ("connect.connected", "connected"),
+    ("connect.store_unavailable_row", "key store unavailable"),
     ("connect.models_heading", "Models: {provider}"),
     ("connect.fetching", "Fetching models..."),
     ("connect.fetch_error", "Couldn't fetch models: {error}"),
@@ -592,6 +593,10 @@ const ES: Catalog = &[
     ("connect.title", "Conectar un proveedor"),
     ("connect.key_heading", "Clave de API"),
     ("connect.connected", "conectado"),
+    (
+        "connect.store_unavailable_row",
+        "almac\u{e9}n de claves no disponible",
+    ),
     ("connect.models_heading", "Modelos: {provider}"),
     ("connect.fetching", "Obteniendo modelos..."),
     (
@@ -755,6 +760,25 @@ mod tests {
                     "{name} {key} is {columns} columns; it is truncated at {INNER_WIDTH}: {value}"
                 );
             }
+        }
+    }
+
+    /// The connect modal's provider rows share the footers' 60-column popup (58 inner), but
+    /// `every_footer_fits_the_popup_in_both_locales` gates `*.footer` keys only. `anthropic` is
+    /// the longest id in `PROVIDER_NAMES`, and the row is drawn as `"> {id} ({suffix})"`.
+    #[test]
+    fn the_unavailable_row_suffix_fits_the_popup_in_both_locales() {
+        const INNER_WIDTH: usize = 58;
+        for (locale, name) in [(Locale::En, "EN"), (Locale::Es, "ES")] {
+            let row = format!(
+                "> anthropic ({})",
+                t(locale, "connect.store_unavailable_row")
+            );
+            let columns = row.chars().count();
+            assert!(
+                columns <= INNER_WIDTH,
+                "{name} row is {columns} columns: {row}"
+            );
         }
     }
 

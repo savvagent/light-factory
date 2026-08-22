@@ -24,12 +24,27 @@ pub(crate) fn mask(input: &str) -> String {
     "*".repeat(input.chars().count())
 }
 
-/// One row of the connect modal's provider list. Self-contained (id + connected flag) so the pure
-/// transition function needs no store/keyring/network state.
+/// Whether a provider row has a key behind it.
+///
+/// Three states rather than a boolean because the failure that motivated them is a store that
+/// cannot answer: rendering that as "no key" tells the user to store a key they may already have
+/// stored, and the false branch is the one that routes to key entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowKey {
+    /// A key is available, from the environment or the store.
+    Present,
+    /// The store answered, and there is no key.
+    Absent,
+    /// The store could not be read, so whether a key exists is unknown.
+    Unavailable,
+}
+
+/// One row of the connect modal's provider list. Self-contained (id + key state) so the pure
+/// transition can decide navigation without touching the keyring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderRow {
     pub(crate) id: String,
-    pub(crate) connected: bool,
+    pub(crate) key: RowKey,
 }
 
 /// The connect modal's step. `rows` is carried through every step so "back" navigation can
@@ -466,7 +481,13 @@ fn connect_step_next(step: &ConnectStep, key: KeyEvent) -> ModalTransition {
                 selected: cycle_index(*selected, rows.len(), 1),
             })),
             KeyCode::Enter => match rows.get(*selected) {
-                Some(row) if row.connected || row.id == "ollama" => {
+                // `Unavailable` proceeds like `Present`: the fetch re-reads the store and reports
+                // the real failure, where key entry would ask for a key the user may already have
+                // stored and then fail to write it to the same store.
+                Some(row)
+                    if matches!(row.key, RowKey::Present | RowKey::Unavailable)
+                        || row.id == "ollama" =>
+                {
                     ModalTransition::Step(Modal::Connect(ConnectStep::ModelList {
                         rows: rows.clone(),
                         provider: row.id.clone(),
@@ -990,10 +1011,13 @@ fn connect_view(step: &ConnectStep, ctx: &ModalContext<'_>) -> PopupView {
                 } else {
                     Style::default()
                 };
-                let suffix = if row.connected {
-                    format!(" ({})", i18n::t(ctx.locale, "connect.connected"))
-                } else {
-                    String::new()
+                let suffix = match row.key {
+                    RowKey::Present => format!(" ({})", i18n::t(ctx.locale, "connect.connected")),
+                    RowKey::Absent => String::new(),
+                    RowKey::Unavailable => format!(
+                        " ({})",
+                        i18n::t(ctx.locale, "connect.store_unavailable_row")
+                    ),
                 };
                 lines.push(Line::from(Span::styled(
                     format!("{marker}{}{suffix}", row.id),
@@ -1396,10 +1420,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
-    fn row(id: &str, connected: bool) -> ProviderRow {
+    fn row(id: &str, key: RowKey) -> ProviderRow {
         ProviderRow {
             id: id.to_string(),
-            connected,
+            key,
         }
     }
 
@@ -1516,9 +1540,9 @@ mod tests {
     #[test]
     fn connect_provider_enter_routes_by_connection_state() {
         let rows = vec![
-            row("openai", false),
-            row("ollama", true),
-            row("gemini", true),
+            row("openai", RowKey::Absent),
+            row("ollama", RowKey::Present),
+            row("gemini", RowKey::Present),
         ];
         let step = ConnectStep::ProviderList {
             rows: rows.clone(),
@@ -1552,9 +1576,51 @@ mod tests {
         ));
     }
 
+    /// The store could not be asked, so Enter must not route to key entry: that would demand a
+    /// key the user may already have stored, and storing it would fail against the same store.
+    #[test]
+    fn an_unavailable_row_goes_to_the_model_list_not_key_entry() {
+        let step = ConnectStep::ProviderList {
+            rows: vec![ProviderRow {
+                id: "openai".to_string(),
+                key: RowKey::Unavailable,
+            }],
+            selected: 0,
+        };
+        let ModalTransition::Step(Modal::Connect(next)) =
+            connect_step_next(&step, key(KeyCode::Enter))
+        else {
+            panic!("Enter must step");
+        };
+        assert!(
+            matches!(next, ConnectStep::ModelList { .. }),
+            "expected the model list, got {next:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_row_still_goes_to_key_entry() {
+        let step = ConnectStep::ProviderList {
+            rows: vec![ProviderRow {
+                id: "openai".to_string(),
+                key: RowKey::Absent,
+            }],
+            selected: 0,
+        };
+        let ModalTransition::Step(Modal::Connect(next)) =
+            connect_step_next(&step, key(KeyCode::Enter))
+        else {
+            panic!("Enter must step");
+        };
+        assert!(
+            matches!(next, ConnectStep::KeyEntry { .. }),
+            "expected key entry, got {next:?}"
+        );
+    }
+
     #[test]
     fn connect_ollama_skips_the_key_step_even_when_unconnected() {
-        let rows = vec![row("ollama", false)];
+        let rows = vec![row("ollama", RowKey::Absent)];
         let step = ConnectStep::ProviderList { rows, selected: 0 };
         assert!(matches!(
             connect_step_next(&step, key(KeyCode::Enter)),
@@ -1565,7 +1631,7 @@ mod tests {
     #[test]
     fn connect_esc_closes_from_provider_list() {
         let step = ConnectStep::ProviderList {
-            rows: vec![row("openai", false)],
+            rows: vec![row("openai", RowKey::Absent)],
             selected: 0,
         };
         assert_eq!(
@@ -1576,7 +1642,7 @@ mod tests {
 
     #[test]
     fn connect_key_entry_enter_blank_stays_and_esc_returns_to_list() {
-        let rows = vec![row("openai", false)];
+        let rows = vec![row("openai", RowKey::Absent)];
         let step = ConnectStep::KeyEntry {
             rows: rows.clone(),
             provider: "openai".to_string(),
@@ -1597,7 +1663,7 @@ mod tests {
 
     #[test]
     fn connect_key_entry_enter_with_key_fetches_models() {
-        let rows = vec![row("openai", false)];
+        let rows = vec![row("openai", RowKey::Absent)];
         let step = ConnectStep::KeyEntry {
             rows,
             provider: "openai".to_string(),
@@ -1617,7 +1683,7 @@ mod tests {
     #[test]
     fn connect_model_list_enter_selects_and_esc_routes_back() {
         let step = ConnectStep::ModelList {
-            rows: vec![row("openai", false)],
+            rows: vec![row("openai", RowKey::Absent)],
             provider: "openai".to_string(),
             models: vec!["gpt-4o".to_string()],
             selected: 0,
@@ -1636,7 +1702,7 @@ mod tests {
         );
 
         let step = ConnectStep::ModelList {
-            rows: vec![row("openai", false)],
+            rows: vec![row("openai", RowKey::Absent)],
             provider: "openai".to_string(),
             models: vec![],
             selected: 0,
@@ -1650,7 +1716,7 @@ mod tests {
         ));
 
         let step = ConnectStep::ModelList {
-            rows: vec![row("ollama", false)],
+            rows: vec![row("ollama", RowKey::Absent)],
             provider: "ollama".to_string(),
             models: vec![],
             selected: 0,
@@ -1667,7 +1733,7 @@ mod tests {
     #[test]
     fn connect_model_list_enter_is_a_noop_while_fetching() {
         let step = ConnectStep::ModelList {
-            rows: vec![row("openai", false)],
+            rows: vec![row("openai", RowKey::Absent)],
             provider: "openai".to_string(),
             models: vec![],
             selected: 0,
@@ -1686,7 +1752,11 @@ mod tests {
 
     #[test]
     fn connect_up_down_wrap_the_provider_selection() {
-        let rows = vec![row("a", false), row("b", false), row("c", false)];
+        let rows = vec![
+            row("a", RowKey::Absent),
+            row("b", RowKey::Absent),
+            row("c", RowKey::Absent),
+        ];
         let step = ConnectStep::ProviderList { rows, selected: 0 };
         assert!(matches!(
             connect_step_next(&step, key(KeyCode::Up)),
@@ -2279,7 +2349,7 @@ mod tests {
     fn opening_a_modal_replaces_whatever_was_open_and_invalidates_its_fetch() {
         let mut host = ModalHost::default();
         host.open(Modal::Connect(ConnectStep::ProviderList {
-            rows: vec![row("anthropic", true)],
+            rows: vec![row("anthropic", RowKey::Present)],
             selected: 0,
         }));
         let first = host.nonce();
@@ -2327,7 +2397,7 @@ mod tests {
     fn a_step_that_walks_away_from_a_fetch_invalidates_it() {
         let mut host = ModalHost::default();
         host.open(Modal::Connect(ConnectStep::ModelList {
-            rows: vec![row("openai", true)],
+            rows: vec![row("openai", RowKey::Present)],
             provider: "openai".to_string(),
             models: vec![],
             selected: 0,
@@ -2337,7 +2407,7 @@ mod tests {
         }));
         let awaiting = host.nonce();
         host.replace_step(Modal::Connect(ConnectStep::ProviderList {
-            rows: vec![row("openai", true)],
+            rows: vec![row("openai", RowKey::Present)],
             selected: 0,
         }));
         assert!(
@@ -2348,7 +2418,7 @@ mod tests {
         // So does switching which provider is being awaited.
         let switched = host.nonce();
         host.replace_step(Modal::Connect(ConnectStep::ModelList {
-            rows: vec![row("openai", true)],
+            rows: vec![row("openai", RowKey::Present)],
             provider: "gemini".to_string(),
             models: vec![],
             selected: 0,
@@ -2401,7 +2471,7 @@ mod tests {
     #[test]
     fn connect_enter_on_a_model_list_applies_instead_of_closing() {
         let step = ConnectStep::ModelList {
-            rows: vec![row("openai", true)],
+            rows: vec![row("openai", RowKey::Present)],
             provider: "openai".into(),
             models: vec!["gpt-5".into(), "gpt-5-mini".into()],
             selected: 1,
