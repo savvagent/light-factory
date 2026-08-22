@@ -70,9 +70,14 @@ impl ProviderInfo {
     /// offline.
     ///
     /// The offline line is substituted only for [`OfflineReason::NothingConfigured`], and only
-    /// when a store actually failed: that is the one case where the store is why `keys` is empty.
-    /// Every other reason has its own real cause, and overwriting it would repeat the defect this
-    /// exists to fix, in the other direction — the failure is already reported on its own line.
+    /// when a store actually failed: that is the one case where the store is unambiguously why
+    /// `keys` is empty. Overwriting another reason would repeat the defect this exists to fix, in
+    /// the other direction, and the store failure is reported on its own line above it either way.
+    ///
+    /// [`OfflineReason::NamedProviderMissingKey`] is the imprecise corner: `LIGHT_REMOTE_PROVIDER`
+    /// naming a provider whose stored key could not be read still reports "{key} is not set",
+    /// which is true of the variable but silent about the store. The line above it names the real
+    /// cause, so the user is not misdirected; sharpening the wording is savvagent/light-factory#67.
     pub fn notices(&self, locale: Locale) -> Vec<String> {
         let mut lines = self.warnings.clone();
         for failure in &self.store_failures {
