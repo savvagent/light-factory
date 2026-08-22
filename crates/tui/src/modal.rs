@@ -124,12 +124,18 @@ pub(crate) enum ModelsStep {
         input: String,
         error: Option<String>,
     },
-    /// A credential-class fetch failure (no key resolved, or the provider refused the one we sent).
-    /// Typing a model id cannot repair a credential, so this step shows the remedy and takes no
-    /// input.
+    /// A credential-class fetch failure (no key resolved, the provider refused the one we sent,
+    /// or the credential store could not be read). Typing a model id cannot repair a credential,
+    /// so this step shows a remedy and takes no input.
+    ///
+    /// `remedy` is already localized and already class-specific: `/connect` and `/key` are the
+    /// answer to a missing or rejected key, and are useless against a store that cannot be read,
+    /// so the step carries the sentence rather than deriving it at render time. That keeps the
+    /// render a pure function of the step, as every other arm is.
     Credentials {
         provider: String,
         error: String,
+        remedy: String,
     },
     Offline,
 }
@@ -147,13 +153,31 @@ pub(crate) enum FetchFailure {
     Auth,
     /// Anything else: DNS, refused connection, TLS, timeout, 5xx, malformed body.
     Fetch,
+    /// The credential store could not be read, so whether a key exists is unknown. Distinct from
+    /// [`FetchFailure::MissingKey`]: the remedy for a missing key is to store one, which is not a
+    /// remedy for a store that cannot be read.
+    ///
+    /// Nothing outside the tests builds one yet — key resolution still collapses an unreadable
+    /// store into `MissingKey`. `expect` rather than `allow` so that the suppression becomes a
+    /// compile error the moment resolution starts reporting the store failure it hides.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "key resolution does not report an unreadable store yet"
+        )
+    )]
+    StoreUnavailable,
 }
 
 impl FetchFailure {
     /// Whether the remedy is a credential (`/connect`, `/key`) rather than a retry. The single
     /// predicate the modal branches on, so a future class only has to answer this question.
     pub(crate) fn needs_credentials(self) -> bool {
-        matches!(self, FetchFailure::MissingKey | FetchFailure::Auth)
+        matches!(
+            self,
+            FetchFailure::MissingKey | FetchFailure::Auth | FetchFailure::StoreUnavailable
+        )
     }
 }
 
@@ -1121,17 +1145,13 @@ fn models_view(step: &ModelsStep, ctx: &ModalContext<'_>) -> PopupView {
         // count, so nothing should be clipped — but if a very short terminal clips anyway, what
         // survives must be the remedy and the input box rather than the remote-supplied error that
         // would otherwise have displaced them.
-        ModelsStep::Credentials { provider, error } => {
+        ModelsStep::Credentials { error, remedy, .. } => {
             lines.push(Line::from(Span::styled(
                 i18n::t(ctx.locale, "models.credentials_hint"),
                 Style::default().fg(Color::DarkGray),
             )));
             lines.push(Line::from(Span::styled(
-                i18n::t_with(
-                    ctx.locale,
-                    "models.credentials_remedy",
-                    &[("provider", provider)],
-                ),
+                remedy.clone(),
                 Style::default().fg(Color::DarkGray),
             )));
             lines.push(Line::from(""));
@@ -1140,8 +1160,8 @@ fn models_view(step: &ModelsStep, ctx: &ModalContext<'_>) -> PopupView {
                 Style::default().fg(Color::Red),
             )));
             // A 401/403 is not always about the key — a corporate proxy, a WAF, or an IP
-            // allowlist produces the same status — so the step keeps a retry rather than
-            // dead-ending on a remedy that cannot apply.
+            // allowlist produces the same status — and a store failure can be a transient D-Bus
+            // blip, so the step keeps a retry rather than dead-ending on a remedy.
             footer = i18n::t(ctx.locale, "models.footer_retry");
         }
         ModelsStep::Manual {
@@ -1852,6 +1872,7 @@ mod tests {
         let step = ModelsStep::Credentials {
             provider: "openai".to_string(),
             error: "refused".to_string(),
+            remedy: "remedy".to_string(),
         };
         assert_eq!(
             models_step_next(&step, ctrl_key(KeyCode::Char('r'))),
@@ -1891,6 +1912,7 @@ mod tests {
         let step = ModelsStep::Credentials {
             provider: "openai".to_string(),
             error: "refused".to_string(),
+            remedy: "remedy".to_string(),
         };
         assert_eq!(
             models_step_next(&step, key(KeyCode::Esc)),
@@ -2045,6 +2067,16 @@ mod tests {
             "a missing key must route to the credential step"
         );
         assert_eq!(err.message, "No API key for openai");
+    }
+
+    /// A store failure is a credential-class failure: no model id repairs a credential store, so
+    /// the modal must show the remedy step rather than the manual-entry step.
+    #[test]
+    fn a_store_failure_needs_credentials() {
+        assert!(FetchFailure::StoreUnavailable.needs_credentials());
+        assert!(FetchFailure::MissingKey.needs_credentials());
+        assert!(FetchFailure::Auth.needs_credentials());
+        assert!(!FetchFailure::Fetch.needs_credentials());
     }
 
     /// The provider's own text is remote-controlled and unbounded. It reaches a rendered line, so
@@ -2203,6 +2235,7 @@ mod tests {
         let credentials = ModelsStep::Credentials {
             provider: "openai".to_string(),
             error: "nope".to_string(),
+            remedy: "remedy".to_string(),
         };
         assert_eq!(
             models_step_next(&credentials, key(KeyCode::Enter)),
@@ -2386,6 +2419,7 @@ mod tests {
             Modal::Models(ModelsStep::Credentials {
                 provider: "openai".into(),
                 error: "nope".into(),
+                remedy: "remedy".to_string(),
             })
             .fetch_target(),
             None
@@ -2423,6 +2457,7 @@ mod tests {
             ModelsStep::Credentials {
                 provider: "openai".to_string(),
                 error: "refused".to_string(),
+                remedy: "remedy".to_string(),
             },
             models_manual_step("gpt-"),
             models_list_step(vec![], false),

@@ -280,6 +280,10 @@ const EN: Catalog = &[
     ("connect.footer_models", "Enter: select · Esc: back"),
     ("connect.footer_fetching", "Esc: cancel"),
     ("connect.no_key", "No API key for {provider}"),
+    (
+        "connect.store_unavailable",
+        "the credential store for {provider} could not be read: {error}",
+    ),
     ("models.title", "Select a model"),
     ("models.offline", "Use /connect to connect a provider first"),
     (
@@ -297,6 +301,10 @@ const EN: Catalog = &[
     (
         "models.credentials_remedy",
         "Use /connect, /key {provider}, or /model <id>",
+    ),
+    (
+        "models.store_remedy",
+        "Unlock the credential store and retry, or set {provider}'s API key in the environment",
     ),
     (
         "models.footer_list",
@@ -601,6 +609,10 @@ const ES: Catalog = &[
     ("connect.footer_models", "Enter: elegir · Esc: volver"),
     ("connect.footer_fetching", "Esc: cancelar"),
     ("connect.no_key", "No hay clave de API para {provider}"),
+    (
+        "connect.store_unavailable",
+        "no se pudo leer el almac\u{e9}n de credenciales de {provider}: {error}",
+    ),
     ("models.title", "Seleccionar un modelo"),
     (
         "models.offline",
@@ -621,6 +633,10 @@ const ES: Catalog = &[
     (
         "models.credentials_remedy",
         "Usa /connect, /key {provider}, o /model <id>",
+    ),
+    (
+        "models.store_remedy",
+        "Desbloquea el almac\u{e9}n de credenciales y reintenta, o define la clave de API de {provider} en el entorno",
     ),
     (
         "models.footer_list",
