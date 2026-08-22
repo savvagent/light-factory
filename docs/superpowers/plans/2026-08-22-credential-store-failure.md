@@ -1061,6 +1061,25 @@ In `crates/tui/src/i18n.rs`, add `("provider.key.unavailable", "unavailable"),` 
 `("provider.key.unavailable", "no disponible"),` to `ES` after its `provider.key.none`
 (line 500).
 
+- [ ] **Step 6a: Remove Task 3's temporary dead-code expectation**
+
+Task 3 added `#[cfg_attr(not(test), expect(dead_code, reason = "key resolution does not report an
+unreadable store yet"))]` to `FetchFailure::StoreUnavailable`, because nothing in non-test code
+constructed it until Step 4 above. Step 4 now does, so the `expect` is unfulfilled and the build
+fails under `-D warnings`. Delete the whole `#[cfg_attr(...)]` block and the two paragraphs of the
+variant's doc comment that explain it, leaving the first paragraph ("The credential store could not
+be read…") intact. That the compiler forces this is why `expect` was used instead of `allow`.
+
+- [ ] **Step 6b: Rename the colliding test-local store double in `app.rs`**
+
+`crates/tui/src/app.rs`'s `mod tests` already contains an unrelated `struct FailingStore;` whose
+`get`/`delete` return `Ok` and whose `set` fails, used by
+`handle_connect_key_keyring_failure_sets_error_and_stays`. Two different doubles under one name in
+one file is a trap. Rename the local one to `SetFailsStore`, update its doc comment to
+`/// A store whose \`set\` always fails, for exercising the keyring write-failure branch.`, and
+update its single use site. Do not change its behaviour or what that test asserts — the new tests
+in this task use the fully-qualified `light_factory_tui::credentials::FailingStore`.
+
 - [ ] **Step 6: Stop `/connect` reporting an unreadable store as unconnected**
 
 In `crates/tui/src/app.rs`, `build_provider_rows` currently reads
@@ -1757,3 +1776,17 @@ git commit -m "tui: name the credential store when it is why the provider fell b
 
 Expected: all green; clippy clean. The `crates/persistence` integration test skips without
 `DATABASE_URL` — that is the documented pre-existing behaviour, not a regression.
+
+## Deviations from the plan as written
+
+- **Task 3 added a temporary `expect(dead_code)` on `FetchFailure::StoreUnavailable`.** The task as
+  written left the variant constructed only by tests until Task 4 wired the resolution seam, which
+  fails the bin target under `-D warnings`. The implementer added
+  `#[cfg_attr(not(test), expect(dead_code, reason = "…"))]` — `expect` rather than `allow`, so the
+  suppression becomes a compile error the moment Task 4 constructs the variant. Task 4 Step 6a
+  removes it. Accepted: the alternative was to merge Tasks 3 and 4, losing the independent review
+  of the class and its remedy.
+- **Task 4 renames `app.rs`'s test-local `FailingStore` to `SetFailsStore`** (Step 6b). Not in the
+  original plan; added after the Task 2 spec review flagged that the library's new `FailingStore`
+  (all operations fail) and a pre-existing test-local `FailingStore` (only `set` fails) would
+  otherwise share a name in one file.
