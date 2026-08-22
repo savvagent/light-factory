@@ -41,8 +41,8 @@ This plan implements it exactly.
   store is a TUI concept, so `OfflineReason` gains no variant.
 - **No `Cargo.toml` version bump.** `crates/tui/src/lib.rs` exposes only `credentials`,
   `engine_view`, and `i18n`; `selection.rs`, `modal.rs`, `app.rs`, `provider.rs`, and the new
-  `text.rs` are binary-crate-internal. The only library-surface change is the additive
-  `FailingStore`, which is semver-minor.
+  `text.rs` are binary-crate-internal. The library-surface changes are the additive `FailingStore`
+  and the new `i18n` catalog entries — both additive, both semver-minor.
 - **No out-of-band surfaces are touched.** No `Dockerfile`/`fly.toml`, no `web/`, no
   `crates/persistence/migrations/`.
 
@@ -113,7 +113,17 @@ mod tests {
     #[test]
     fn one_line_strips_control_characters() {
         assert_eq!(one_line("a\u{1b}[31mb\tc"), "a[31mbc");
-        assert_eq!(one_line("\r\nafter"), "after");
+        assert_eq!(one_line("a\rb"), "ab");
+    }
+
+    /// `str::lines` treats `\r\n` as one terminator, so a message that opens with a blank line
+    /// yields an empty first line. That is the pre-existing `summarize_provider_error` behaviour
+    /// and this refactor must preserve it — changing it would be a behaviour change wearing a
+    /// refactor's clothes.
+    #[test]
+    fn one_line_does_not_skip_a_leading_blank_line() {
+        assert_eq!(one_line("\r\nafter"), "");
+        assert_eq!(one_line("\nafter"), "");
     }
 
     #[test]
@@ -187,7 +197,7 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p light-factory-tui text::`
-Expected: PASS, 6 tests.
+Expected: PASS, 7 tests.
 
 - [ ] **Step 5: Reduce `summarize_provider_error` to a composition of the two helpers**
 
@@ -426,28 +436,22 @@ Add to `crates/tui/src/app.rs`'s `mod tests`:
     #[test]
     fn handle_models_fetched_routes_a_store_failure_to_the_credentials_step() {
         let mut app = test_app();
-        app.open_modal(
-            Modal::Models(ModelsStep::ModelList {
-                provider: "openai".to_string(),
-                models: Vec::new(),
-                selected: 0,
-                fetching: true,
-            }),
-            None,
-        );
-        let nonce = app.modal.nonce();
+        // `open` rather than `App::open_modal`: the latter spawns a fetch, and this is a sync
+        // test with no tokio runtime. The helper exists at app.rs:2147 for exactly this.
+        let nonce = open(&mut app, Modal::Models(models_list_step(vec![], true)));
         app.handle_models_fetched(
             nonce,
             "openai".to_string(),
-            Err(FetchError {
-                class: FetchFailure::StoreUnavailable,
-                message: "the credential store for openai could not be read: locked".to_string(),
-            }),
+            Err(fetch_err(
+                FetchFailure::StoreUnavailable,
+                "the credential store for openai could not be read: locked",
+            )),
         );
-        let Some(Modal::Models(ModelsStep::Credentials { error, remedy, .. })) =
-            app.modal.current()
-        else {
-            panic!("expected the credentials step, got {:?}", app.modal.current());
+        let Some(ModelsStep::Credentials { error, remedy, .. }) = models_step(&app) else {
+            panic!(
+                "a store failure must not offer a model-id box, got {:?}",
+                models_step(&app)
+            );
         };
         assert!(error.contains("could not be read"), "{error}");
         assert!(!remedy.contains("/key"), "{remedy}");
@@ -456,9 +460,10 @@ Add to `crates/tui/src/app.rs`'s `mod tests`:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p light-factory-tui store_failure`
+Run: `cargo test -p light-factory-tui`
 Expected: FAIL to compile — `no variant named 'StoreUnavailable' found for enum 'FetchFailure'`
-and `no method named 'credentials_remedy'`.
+and `no method named 'credentials_remedy'`. (Run the whole crate rather than a name filter: the
+five new tests do not share a substring.)
 
 - [ ] **Step 3: Add the variant and widen `needs_credentials`**
 
@@ -532,9 +537,17 @@ Change the render arm (lines 1135-1157) so it uses the carried remedy in place o
 The `provider` binding is no longer read in this arm; keep it out of the pattern with `..` as
 shown. `models_step_next`'s `Credentials` arm (line 738) still binds `provider` and is unchanged.
 
-Fix every `ModelsStep::Credentials { .. }` construction in `modal.rs`'s `mod tests` (lines 1863,
-1902, 2214, 2397, 2434) by adding `remedy: "remedy".to_string(),`. Do not change what those tests
-assert.
+Fix every `ModelsStep::Credentials` site the compiler now rejects. Do not change what any of these
+tests assert:
+
+- `modal.rs` `mod tests`, constructions at lines 1863, 1902, 2214, 2397, 2434 — add
+  `remedy: "remedy".to_string(),`.
+- `app.rs` `mod tests`, **destructuring patterns** at lines 3317 and 3339
+  (`let Some(ModelsStep::Credentials { provider, error }) = models_step(&app)`) — add `..` so they
+  read `ModelsStep::Credentials { provider, error, .. }`.
+- `app.rs` `mod tests`, the **construction** at line 3360 inside
+  `retry_re_triggers_the_fetch_from_the_credentials_step` — add
+  `remedy: "remedy".to_string(),`.
 
 - [ ] **Step 5: Add the EN and ES strings**
 
@@ -659,11 +672,27 @@ Expected: all green; clippy clean.
 
 - [ ] **Step 1: Write the failing tests**
 
-Replace the existing `classify_distinguishes_env_keyring_and_none`,
-`resolve_key_from_prefers_env_over_keyring`, and
-`resolve_key_from_treats_an_empty_env_value_as_absent` tests in `crates/tui/src/selection.rs`'s
-`mod tests` with tests against the new seam, and add the store-failure cases. Add
-`use light_factory_tui::credentials::FailingStore;` to the test module's imports.
+**Delete all nine pre-existing seam tests** from `crates/tui/src/selection.rs`'s `mod tests` — every
+one of them names a function this task removes or a return type it changes, so leaving any behind is
+either a duplicate definition or a type error:
+
+| Line | Test to delete | Why |
+|---|---|---|
+| 172 | `classify_distinguishes_env_keyring_and_none` | `classify` is deleted |
+| 190 | `resolve_key_from_prefers_env_over_keyring` | `resolve_key_from` is deleted |
+| 203 | `resolve_key_from_treats_an_empty_env_value_as_absent` | `resolve_key_from` is deleted |
+| 214 | `resolve_key_reads_a_stored_keyring_key` | compares `resolve_key_with` to `Option<String>` |
+| 226 | `resolve_key_reads_the_env_var_the_provider_declares` | same |
+| 239 | `resolve_key_never_reads_the_env_for_a_provider_with_no_declared_var` | same |
+| 257 | `resolve_key_with_treats_an_empty_env_value_as_absent` | same; the new block redefines this name |
+| 269 | `resolve_key_delegates_to_the_process_env_reader` | same; the new block redefines this name |
+| 278 | `key_status_with_classifies_every_wiring_outcome` | the new block redefines this name |
+
+**Keep** `settings` (the helper at 163), `non_remote_providers_have_no_key` (183), both
+`apply_preferences_*` tests (293, 303), and all three `build_and_info_*` tests (313, 324, 336).
+
+Add `use light_factory_tui::credentials::FailingStore;` to the test module's imports, then add the
+following in place of the deleted block.
 
 ```rust
     #[test]
@@ -831,30 +860,24 @@ Add to `crates/tui/src/modal.rs`'s `mod tests`:
             err.message
         );
     }
-
-    /// A just-typed key bypasses the store entirely, so a broken store must not block it.
-    #[tokio::test]
-    async fn a_key_override_is_not_blocked_by_a_broken_store() {
-        let store = light_factory_tui::credentials::FailingStore::default();
-        let err = fetch_model_list("openai", Some("sk-typed".to_string()), &store, Locale::En)
-            .await
-            .expect_err("localhost has no OpenAI to answer, so this fails at the transport");
-        assert_ne!(err.class, FetchFailure::StoreUnavailable);
-    }
 ```
 
 Add to `crates/tui/src/app.rs`'s `mod tests`:
 
 ```rust
     /// `/key` must not list a provider as having no key when the store could not be asked.
+    ///
+    /// The assertion is the negative on purpose: `key_status` reads the *process* environment and
+    /// `App` has no injection seam for it, so a developer with `OPENAI_API_KEY` exported gets
+    /// `env` here and anyone else gets `unavailable`. Both are correct; `none` is the defect. The
+    /// strict `KeyStatus::Unavailable` assertion lives in `selection.rs`, where the env is
+    /// injected.
     #[test]
-    fn the_key_listing_names_an_unreadable_store() {
+    fn the_key_listing_never_reports_an_unreadable_store_as_no_key() {
         let app = test_app_with_store(Arc::new(
             light_factory_tui::credentials::FailingStore::default(),
         ));
-        let label = app.key_status_label("openai");
-        assert_eq!(label, "unavailable");
-        assert_ne!(label, app.t("provider.key.none"));
+        assert_ne!(app.key_status_label("openai"), app.t("provider.key.none"));
     }
 ```
 
@@ -1146,15 +1169,20 @@ Add to `crates/tui/src/modal.rs`'s `mod tests`:
     }
 ```
 
-Use whatever plain-key helper the surrounding tests already use to build a `KeyEvent` for
-`KeyCode::Enter` (the file has one next to `ctrl_key`); do not add a second.
+`key` is the existing plain-key helper (`fn key(code: KeyCode) -> KeyEvent` at `modal.rs:1376`,
+next to `ctrl_key` at `:1380`); do not add a second.
 
 Add to `crates/tui/src/app.rs`'s `mod tests`:
 
 ```rust
-    /// An unreadable store must not render every provider as though no key were stored.
+    /// An unreadable store must not render a provider as though no key were stored — that is the
+    /// row state that routes Enter to key entry.
+    ///
+    /// Negative assertion for the same reason as `the_key_listing_never_reports_...`: with
+    /// `OPENAI_API_KEY` exported this row is `Present`, without it `Unavailable`. `Absent` is the
+    /// defect. `RowKey::Unavailable` itself is pinned in `modal.rs`'s transition tests.
     #[test]
-    fn provider_rows_report_an_unreadable_store() {
+    fn provider_rows_never_report_an_unreadable_store_as_having_no_key() {
         let app = test_app_with_store(Arc::new(
             light_factory_tui::credentials::FailingStore::default(),
         ));
@@ -1163,7 +1191,7 @@ Add to `crates/tui/src/app.rs`'s `mod tests`:
             .iter()
             .find(|r| r.id == "openai")
             .expect("openai is a listed provider");
-        assert_eq!(openai.key, RowKey::Unavailable);
+        assert_ne!(openai.key, RowKey::Absent);
     }
 
     #[test]
@@ -1232,8 +1260,8 @@ pub(crate) struct ProviderRow {
 }
 ```
 
-Keep whatever derives the original `ProviderRow` carried; the list above is the original set plus
-nothing. If the original had additional derives, retain them.
+The derive list above (`Debug, Clone, PartialEq, Eq`) is exactly what `ProviderRow` already carries
+at `modal.rs:29` — unchanged.
 
 Update the Enter arm (lines 454-470):
 
@@ -1366,7 +1394,7 @@ Expected: all green; clippy clean.
   `ProviderInfo::notices`, and the `info` test helper at 74-82)
 - Modify: `crates/tui/src/selection.rs` (`apply_preferences` at 108-126, `build_selection` at
   128-131, `rebuild` at 146-152)
-- Modify: `crates/tui/src/app.rs` (`enter_engine`'s notice assembly at lines 332-338, and the
+- Modify: `crates/tui/src/app.rs` (`enter_engine`'s notice assembly at lines 333-339, and the
   `ProviderInfo` construction in `test_app_with_store`)
 - Modify: `crates/tui/src/i18n.rs` (`provider.store.unavailable`,
   `provider.offline.store_unavailable`, EN + ES)
@@ -1591,7 +1619,7 @@ opening a second one. Update the `info` test helper (lines 74-82) to add
 - [ ] **Step 4: Add the EN and ES strings**
 
 In `crates/tui/src/i18n.rs`, add to `EN` next to the other `provider.offline.*` entries
-(lines 119-130):
+(lines 120-130):
 
 ```rust
     (
@@ -1600,11 +1628,11 @@ In `crates/tui/src/i18n.rs`, add to `EN` next to the other `provider.offline.*` 
     ),
     (
         "provider.offline.store_unavailable",
-        "Falling back to offline: the credential store could not be read, so stored keys were unavailable",
+        "Falling back to the offline provider: the credential store could not be read, so stored keys were unavailable",
     ),
 ```
 
-and to `ES` at the mirrored positions (lines 413-424):
+and to `ES` at the mirrored positions (lines 414-424):
 
 ```rust
     (
@@ -1613,7 +1641,7 @@ and to `ES` at the mirrored positions (lines 413-424):
     ),
     (
         "provider.offline.store_unavailable",
-        "Usando modo sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales, as\u{ed} que las claves guardadas no estaban disponibles",
+        "Usando el proveedor sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales, as\u{ed} que las claves guardadas no estaban disponibles",
     ),
 ```
 
@@ -1687,9 +1715,24 @@ Add `store_failures: Vec::new(),` to the `ProviderInfo` literal in `build_and_in
 
 - [ ] **Step 6: Render the notices**
 
-In `crates/tui/src/app.rs`, replace `enter_engine`'s notice assembly (lines 332-338) with:
+In `crates/tui/src/app.rs`, `enter_engine` currently reads:
 
 ```rust
+        self.engine_log.clear();
+        for warning in info.warnings {
+            self.engine_log.push(warning);
+        }
+        if let Some(reason) = &info.offline {
+            self.engine_log
+                .push(crate::provider::offline_notice(self.config.lang, reason));
+        }
+```
+
+Replace **only the loop and the `if let`** (lines 333-339) — `self.engine_log.clear()` on line 332
+stays, or the engine log accumulates across re-entries:
+
+```rust
+        self.engine_log.clear();
         self.engine_log.extend(info.notices(self.config.lang));
 ```
 
@@ -1698,7 +1741,7 @@ Add `store_failures: Vec::new(),` to the `ProviderInfo` literal in `test_app_wit
 - [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p light-factory-tui`
-Expected: PASS — the ten new tests plus all pre-existing ones.
+Expected: PASS — the nine new tests plus all pre-existing ones.
 
 - [ ] **Step 8: Run the whole workspace, clippy, and commit**
 
