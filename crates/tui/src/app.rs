@@ -330,13 +330,7 @@ impl App {
         self.engine_session = Some(session);
         self.engine_forward_task = Some(forwarder);
         self.engine_log.clear();
-        for warning in info.warnings {
-            self.engine_log.push(warning);
-        }
-        if let Some(reason) = &info.offline {
-            self.engine_log
-                .push(crate::provider::offline_notice(self.config.lang, reason));
-        }
+        self.engine_log.extend(info.notices(self.config.lang));
         self.engine_prompt.clear();
         self.pending = None;
         self.mode = Mode::Engine;
@@ -2032,6 +2026,7 @@ mod tests {
             offline: None,
             selected_by: None,
             warnings: Vec::new(),
+            store_failures: Vec::new(),
         };
         let (events, _rx) = mpsc::unbounded_channel::<UiEvent>();
         // Isolation by construction: no test may ever write the developer's real config.json.

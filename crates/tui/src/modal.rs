@@ -1750,6 +1750,49 @@ mod tests {
         ));
     }
 
+    /// The row state must reach the rendered row. The transition tests pin navigation and the i18n
+    /// tests pin the strings, but nothing else connects the two — a suffix wired to the wrong key
+    /// would pass both.
+    #[test]
+    fn the_provider_list_renders_one_suffix_per_row_state() {
+        let ctx = ModalContext {
+            locale: Locale::En,
+            error: None,
+            offline: None,
+        };
+        let view = connect_view(
+            &ConnectStep::ProviderList {
+                rows: vec![
+                    row("anthropic", RowKey::Present),
+                    row("openai", RowKey::Absent),
+                    row("gemini", RowKey::Unavailable),
+                ],
+                selected: 0,
+            },
+            &ctx,
+        );
+        let body: Vec<String> = view
+            .body
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(body[0].contains("anthropic (connected)"), "{body:?}");
+        assert_eq!(
+            body[1].trim(),
+            "openai",
+            "an absent key adds no suffix: {body:?}"
+        );
+        assert!(
+            body[2].contains("gemini (key store unavailable)"),
+            "{body:?}"
+        );
+    }
+
     #[test]
     fn connect_up_down_wrap_the_provider_selection() {
         let rows = vec![

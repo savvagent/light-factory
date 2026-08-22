@@ -128,6 +128,14 @@ const EN: Catalog = &[
         "provider.offline.base_url",
         "{var} was rejected — falling back to offline",
     ),
+    (
+        "provider.store.unavailable",
+        "Could not read the stored key for {provider}: {error}",
+    ),
+    (
+        "provider.offline.store_unavailable",
+        "Falling back to the offline provider: the credential store could not be read, so stored keys were unavailable",
+    ),
     ("status.ask_empty", "Usage: /ask <prompt>"),
     (
         "status.ask_not_connected",
@@ -431,6 +439,14 @@ const ES: Catalog = &[
     (
         "provider.offline.base_url",
         "{var} fue rechazada — usando modo sin conexión",
+    ),
+    (
+        "provider.store.unavailable",
+        "No se pudo leer la clave guardada de {provider}: {error}",
+    ),
+    (
+        "provider.offline.store_unavailable",
+        "Usando el proveedor sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales, as\u{ed} que las claves guardadas no estaban disponibles",
     ),
     ("status.ask_empty", "Uso: /ask <indicación>"),
     (

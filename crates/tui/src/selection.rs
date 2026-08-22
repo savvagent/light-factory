@@ -8,7 +8,7 @@ use light_factory_providers::{
 };
 use light_factory_tui::credentials::CredentialStore;
 
-use crate::provider::ProviderInfo;
+use crate::provider::{ProviderInfo, StoreFailure};
 use crate::settings::Settings;
 use crate::text::one_line;
 
@@ -135,18 +135,30 @@ pub fn resolve_key(provider: &str, store: &dyn CredentialStore) -> KeyResolution
     resolve_key_with(provider, store, process_env)
 }
 
-/// Layer the persisted preferences and keyring keys over an env-derived [`Selection`]. Pure and
-/// testable: the caller supplies the base.
+/// Layer the persisted preferences and stored keys over an env-derived [`Selection`], reporting
+/// any provider whose stored key could not be read.
+///
+/// A failed read contributes no key and one [`StoreFailure`]: the fallback is unchanged, but it
+/// is no longer silent.
 pub fn apply_preferences(
     mut base: Selection,
     settings: &Settings,
     store: &dyn CredentialStore,
-) -> Selection {
+) -> (Selection, Vec<StoreFailure>) {
+    let mut failures = Vec::new();
     for id in REMOTE_IDS {
-        if !base.keys.contains_key(id)
-            && let Ok(Some(key)) = store.get(id)
-        {
-            base.keys.insert(id.to_string(), key);
+        if base.keys.contains_key(id) {
+            continue;
+        }
+        match read_store(id, store) {
+            Ok(Some(key)) => {
+                base.keys.insert(id.to_string(), key);
+            }
+            Ok(None) => {}
+            Err(error) => failures.push(StoreFailure {
+                provider: id.to_string(),
+                error,
+            }),
         }
     }
     base.preferred = settings.provider.clone();
@@ -155,12 +167,15 @@ pub fn apply_preferences(
             .entry(id.clone())
             .or_insert_with(|| model.clone());
     }
-    base
+    (base, failures)
 }
 
-/// Assemble the effective [`Selection`]: environment (via the providers crate), then the keyring
-/// and persisted preferences layered on top.
-pub fn build_selection(settings: &Settings, store: &dyn CredentialStore) -> Selection {
+/// Assemble the effective [`Selection`]: environment (via the providers crate), then the stored
+/// keys and persisted preferences layered on top, plus any store failure encountered.
+pub fn build_selection(
+    settings: &Settings,
+    store: &dyn CredentialStore,
+) -> (Selection, Vec<StoreFailure>) {
     apply_preferences(selection_from_env(), settings, store)
 }
 
@@ -174,16 +189,20 @@ fn build_and_info(selection: &Selection) -> (Arc<dyn Provider>, ProviderInfo) {
         offline: built.offline,
         selected_by: built.selected_by,
         warnings: built.warnings,
+        store_failures: Vec::new(),
     };
     (Arc::from(built.provider), info)
 }
 
-/// Build the active provider and its display record from the given settings and keyring.
+/// Build the active provider and its display record from the given settings and credential store.
 pub fn rebuild(
     settings: &Settings,
     store: &dyn CredentialStore,
 ) -> (Arc<dyn Provider>, ProviderInfo) {
-    build_and_info(&build_selection(settings, store))
+    let (selection, store_failures) = build_selection(settings, store);
+    let (provider, mut info) = build_and_info(&selection);
+    info.store_failures = store_failures;
+    (provider, info)
 }
 
 #[cfg(test)]
@@ -357,7 +376,7 @@ mod tests {
         let store = MemStore::new();
         store.set("openai", "sk-o").unwrap();
         let base = Selection::default();
-        let selection = apply_preferences(base, &settings(Some("openai")), &store);
+        let (selection, _failures) = apply_preferences(base, &settings(Some("openai")), &store);
         assert_eq!(selection.preferred.as_deref(), Some("openai"));
         assert_eq!(selection.keys.get("openai"), Some(&"sk-o".to_string()));
     }
@@ -368,8 +387,60 @@ mod tests {
         store.set("openai", "sk-ring").unwrap();
         let mut base = Selection::default();
         base.keys.insert("openai".to_string(), "sk-env".to_string());
-        let selection = apply_preferences(base, &settings(None), &store);
+        let (selection, _failures) = apply_preferences(base, &settings(None), &store);
         assert_eq!(selection.keys.get("openai"), Some(&"sk-env".to_string()));
+    }
+
+    /// The startup path must report a store it could not read instead of silently continuing
+    /// with an empty key map — the silence is what makes the offline fallback inexplicable.
+    #[test]
+    fn apply_preferences_reports_a_store_failure_for_every_remote_provider() {
+        let broken = FailingStore::new("no D-Bus session");
+        let (selection, failures) =
+            apply_preferences(Selection::default(), &settings(None), &broken);
+        assert!(selection.keys.is_empty());
+        assert_eq!(failures.len(), REMOTE_IDS.len());
+        assert!(failures.iter().all(|f| f.error == "no D-Bus session"));
+        assert!(failures.iter().any(|f| f.provider == "openai"));
+    }
+
+    /// A store failure is per-entry, so a partial failure must not discard the keys that did
+    /// resolve. An env-supplied key is already in `base.keys` and is never re-read.
+    #[test]
+    fn apply_preferences_keeps_an_env_key_and_reports_nothing_for_it() {
+        let broken = FailingStore::default();
+        let mut base = Selection::default();
+        base.keys.insert("openai".to_string(), "sk-env".to_string());
+        let (selection, failures) = apply_preferences(base, &settings(None), &broken);
+        assert_eq!(selection.keys.get("openai"), Some(&"sk-env".to_string()));
+        assert!(
+            failures.iter().all(|f| f.provider != "openai"),
+            "a provider the env already answered for is never read from the store"
+        );
+    }
+
+    #[test]
+    fn apply_preferences_reports_no_failures_for_a_working_store() {
+        let store = MemStore::new();
+        store.set("openai", "sk-o").unwrap();
+        let (selection, failures) =
+            apply_preferences(Selection::default(), &settings(Some("openai")), &store);
+        assert!(failures.is_empty());
+        assert_eq!(selection.keys.get("openai"), Some(&"sk-o".to_string()));
+    }
+
+    /// `rebuild` is the startup entry point; the failures have to survive it or nothing can
+    /// render them.
+    /// `build_selection` starts from `selection_from_env()`, so a developer with all four of
+    /// `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`GEMINI_API_KEY`/`DEEPSEEK_API_KEY` exported would see
+    /// every provider skipped before the store is read and no failure recorded. That is the same
+    /// ambient-env caveat the App-level tests carry; the injected-env assertions live in
+    /// `apply_preferences_reports_a_store_failure_for_every_remote_provider` above.
+    #[test]
+    fn rebuild_carries_store_failures_into_the_provider_info() {
+        let broken = FailingStore::default();
+        let (_provider, info) = rebuild(&settings(None), &broken);
+        assert!(!info.store_failures.is_empty());
     }
 
     #[test]
