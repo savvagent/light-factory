@@ -2172,3 +2172,420 @@ now-false comment about the connect modal rendering only the message.
 
 - [ ] **Step 8:** `cargo test -p light-factory-tui`, `OPENAI_API_KEY=sk-test cargo test -p light-factory-tui`,
       clippy, `cargo fmt --all`. Commit as `tui: carry the failure class into the connect modal`.
+
+---
+
+### Task 10: Make the messages actionable and the extension rules exhaustive
+
+Six findings from the review, all local, all in code round 1 wrote.
+
+**Files:** `crates/tui/src/provider.rs`, `crates/tui/src/selection.rs`, `crates/tui/src/text.rs`,
+`crates/tui/src/app.rs`, `crates/tui/src/i18n.rs`.
+
+- [ ] **Step 1: Failing tests**
+
+In `provider.rs`'s `mod tests`:
+
+```rust
+    /// The substituted line replaced one that named a remedy. A broken keyring is exactly when an
+    /// environment variable helps, so the replacement must not be a dead end.
+    #[test]
+    fn the_store_offline_notice_still_names_a_remedy() {
+        let mut info = info(Some(OfflineReason::NothingConfigured), None);
+        info.store_failures = vec![failure("openai")];
+        let line = info
+            .notices(Locale::En)
+            .pop()
+            .expect("an offline provider has an offline line");
+        assert!(line.contains("ANTHROPIC_API_KEY"), "no remedy named: {line}");
+    }
+
+    /// A dead D-Bus session fails every entry with the same words. One line per provider is four
+    /// rows saying one thing; collapse them while keeping the per-provider form when the causes
+    /// genuinely differ.
+    #[test]
+    fn identical_store_failures_collapse_to_one_line() {
+        let mut info = info(Some(OfflineReason::NothingConfigured), None);
+        info.store_failures = REMOTE_IDS
+            .iter()
+            .map(|id| StoreFailure { provider: id.to_string(), error: "no D-Bus session".into() })
+            .collect();
+        let notices = info.notices(Locale::En);
+        assert_eq!(notices.len(), 2, "one collapsed failure line plus the offline line: {notices:?}");
+        assert!(notices[0].contains("no D-Bus session"), "{notices:?}");
+    }
+
+    #[test]
+    fn differing_store_failures_are_reported_per_provider() {
+        let mut info = info(None, Some(SelectedBy::KeyPrecedence));
+        info.store_failures = vec![
+            StoreFailure { provider: "openai".into(), error: "locked".into() },
+            StoreFailure { provider: "gemini".into(), error: "no D-Bus session".into() },
+        ];
+        let notices = info.notices(Locale::En);
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().any(|n| n.contains("openai") && n.contains("locked")));
+        assert!(notices.iter().any(|n| n.contains("gemini") && n.contains("no D-Bus session")));
+    }
+```
+
+`REMOTE_IDS` lives in `crate::selection`; import it in the test module.
+
+In `text.rs`'s `mod tests`:
+
+```rust
+    /// `char::is_control` covers only the Cc block. U+202E and its neighbours are Cf: they survive
+    /// the filter and let a hostile error body control how a row *renders* independently of what it
+    /// says — the Trojan-Source shape, on a modal this repo already treats as a phishing surface.
+    #[test]
+    fn one_line_strips_bidi_and_invisible_formatting() {
+        for c in ['\u{202E}', '\u{2066}', '\u{200F}', '\u{FEFF}', '\u{2060}', '\u{200B}'] {
+            let rendered = one_line(&format!("a{c}b"));
+            assert_eq!(rendered, "ab", "U+{:04X} survived", c as u32);
+        }
+    }
+```
+
+In `selection.rs`'s `mod tests`:
+
+```rust
+    /// The cap belongs at the seam, not at one of the two consumers: the engine-log path never
+    /// capped, so a verbose keyring error reached it unbounded.
+    #[test]
+    fn read_store_bounds_a_verbose_failure() {
+        let store = FailingStore::new("x".repeat(10_000));
+        let Err(error) = read_store("openai", &store) else {
+            panic!("a failing store must not answer Ok");
+        };
+        assert!(error.chars().count() <= STORE_ERROR_MAX_CHARS + 1, "{}", error.chars().count());
+    }
+```
+
+- [ ] **Step 2:** `cargo test -p light-factory-tui` — expect FAIL.
+
+- [ ] **Step 3: Name a remedy in the store-caused offline line.** In `i18n.rs`, extend both
+      catalogs. EN:
+
+```rust
+    (
+        "provider.offline.store_unavailable",
+        "Falling back to the offline provider: the credential store could not be read, so stored keys were unavailable. Unlock it and restart, or set ANTHROPIC_API_KEY (or another provider's key) in the environment.",
+    ),
+```
+
+ES:
+
+```rust
+    (
+        "provider.offline.store_unavailable",
+        "Usando el proveedor sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales, as\u{ed} que las claves guardadas no estaban disponibles. Desbloqu\u{e9}alo y reinicia, o define ANTHROPIC_API_KEY (o la clave de otro proveedor) en el entorno.",
+    ),
+```
+
+Neither is a `*.footer` key, so the 58-column gate does not apply; both are body rows the engine log
+renders one per line.
+
+- [ ] **Step 4: Make the pairing rule exhaustive.** `OfflineReason` comes from another crate and is
+      not `#[non_exhaustive]`, so a `matches!` lets a future variant answer this question silently —
+      while its sibling `offline_notice` right below already matches exhaustively. In
+      `ProviderInfo::notices`:
+
+```rust
+        if let Some(reason) = &self.offline {
+            let store_caused = !self.store_failures.is_empty()
+                && match reason {
+                    // The store is the only reason here that can be *why* `keys` is empty.
+                    OfflineReason::NothingConfigured => true,
+                    // These carry their own cause; overwriting one would repeat the defect this
+                    // exists to fix, in the other direction. The failure is already on its own
+                    // line above.
+                    OfflineReason::NamedProviderMissingKey { .. }
+                    | OfflineReason::BaseUrlRejected { .. } => false,
+                };
+```
+
+Also soften the doc comment's "unambiguously": with an unreadable store you cannot know whether a
+key existed, so the honest claim is that this is the one reason where the alternative notice would
+be a lie.
+
+- [ ] **Step 5: Collapse identical failures.** In `ProviderInfo::notices`, replace the per-failure
+      loop:
+
+```rust
+        // A locked wallet or a dead session bus fails every entry with the same words, so the
+        // per-provider form would be four rows saying one thing. Keep it only when the causes
+        // actually differ, which is the partial failure `KeyringStore`'s per-entry reads allow.
+        match self.store_failures.split_first() {
+            None => {}
+            Some((first, rest)) if rest.iter().all(|f| f.error == first.error) => {
+                lines.push(i18n::t_with(
+                    locale,
+                    "provider.store.unavailable_all",
+                    &[("error", &first.error)],
+                ));
+            }
+            Some(_) => {
+                for failure in &self.store_failures {
+                    lines.push(i18n::t_with(
+                        locale,
+                        "provider.store.unavailable",
+                        &[("provider", &failure.provider), ("error", &failure.error)],
+                    ));
+                }
+            }
+        }
+```
+
+Add `provider.store.unavailable_all` to both catalogs — EN `"Could not read the credential store:
+{error}"`, ES `"No se pudo leer el almac\u{e9}n de credenciales: {error}"`.
+
+Note the single-failure case takes the collapsed branch too (`rest` is empty), which reads correctly:
+one provider failing with one cause is still "could not read the credential store". If a test wants
+the provider named for a lone failure, use the differing-causes branch instead.
+
+- [ ] **Step 6: Cap the store error at the seam.** `read_store`'s comment claims "the length cap
+      belongs to the modal, which already owns it" — true of the `/models` consumer and false of the
+      `apply_preferences` → `notices` → engine-log consumer, which never capped. Fix the code, not
+      the comment:
+
+```rust
+/// The longest store-failure text any consumer renders. The engine log clips rather than wraps, so
+/// an uncapped line loses its tail silently; the modal has its own, tighter cap on top.
+const STORE_ERROR_MAX_CHARS: usize = 160;
+```
+
+```rust
+fn read_store(provider: &str, store: &dyn CredentialStore) -> Result<Option<String>, String> {
+    store
+        .get(provider)
+        .map_err(|e| truncate_chars(&one_line(&format!("{e:#}")), STORE_ERROR_MAX_CHARS))
+}
+```
+
+Import `truncate_chars` alongside `one_line`, and rewrite the doc comment's last sentence to say the
+cap is applied here so both consumers inherit it, with the modal narrowing it further.
+
+- [ ] **Step 7: Strip bidi and invisible formatting in `one_line`.**
+
+```rust
+/// Whether `c` can reorder or hide neighbouring text without occupying a cell of its own.
+///
+/// `char::is_control` covers only the Cc block; the bidi overrides and isolates are Cf and pass
+/// straight through it. A remote error body containing U+202E controls how the row *renders*
+/// independently of what it says, which is the Trojan-Source spoofing shape.
+fn is_invisible_formatting(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{FEFF}')
+}
+```
+
+and in `one_line`, `.filter(|c| !c.is_control() && !is_invisible_formatting(*c))`.
+
+While here, correct `one_line`'s doc: the unbounded-block hazard is the **engine log**, whose
+`ListItem::new(String)` builds a `Text` that splits on `.lines()`. The modal renders a `Line`, which
+does not split — its hazard is length, which `truncate_chars` handles.
+
+- [ ] **Step 8: Give the store *write* paths the same hygiene as the read path.** Four sites in
+      `app.rs` stringify a store error with `e.to_string()` and no `one_line`: the `/key` submit, the
+      connect key-entry submit, and `clear_key`. `e.to_string()` reports only the outermost message,
+      dropping the source chain `read_store` goes out of its way to keep, and the untrimmed text
+      reaches a rendered `Line`. At each, use:
+
+```rust
+                let error = crate::text::one_line(&format!("{e:#}"));
+```
+
+- [ ] **Step 9:** `cargo test -p light-factory-tui`, `OPENAI_API_KEY=sk-test cargo test -p light-factory-tui`,
+      `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all`. Commit as
+      `tui: make the store-failure notices actionable and bound them at the seam`.
+
+---
+
+### Task 11: Close the test gaps and correct six comments
+
+Two state mappings are covered only by negative assertions that would pass if wired to the wrong
+state, one test genuinely fails under a fully-populated environment, and six comments make claims the
+code does not support.
+
+**Files:** `crates/tui/src/app.rs`, `crates/tui/src/selection.rs`, `crates/tui/src/modal.rs`,
+`crates/tui/src/text.rs`, `crates/tui/src/i18n.rs`, `crates/tui/src/credentials.rs`.
+
+- [ ] **Step 1: Strict, env-independent assertions for the two `App` mappings.** `ollama` and
+      `local` declare no env var (`env_key_var` returns `None`), so `env_key` cannot answer and only
+      the store can — the same trick this branch already uses twice. That makes a strict positive
+      assertion available with no production change and no env dependence. In `app.rs`'s `mod tests`,
+      **replace** `the_key_listing_never_reports_an_unreadable_store_as_no_key` and
+      `provider_rows_never_report_an_unreadable_store_as_having_no_key` with:
+
+```rust
+    /// Wire the `Unavailable` arm to `provider.key.keyring` and the old negative assertion still
+    /// passed — `/key` would report a live keyring for a dead one. `ollama` declares no env var, so
+    /// `process_env` cannot decide this and the assertion can be strict.
+    #[test]
+    fn an_unreadable_store_is_labelled_unavailable() {
+        let app = test_app_with_store(Arc::new(
+            light_factory_tui::credentials::FailingStore::default(),
+        ));
+        assert_eq!(
+            app.key_status_label("ollama"),
+            app.t("provider.key.unavailable")
+        );
+    }
+
+    /// Map `Unavailable` to `Present` and the old negative assertion still passed — the row would
+    /// read "openai (connected)" for a store that cannot be read, which is worse than the bug this
+    /// fixes. Asserted on `openai` as a negative (the ambient env can make it `Present`) and on a
+    /// keyless id as a positive.
+    #[test]
+    fn provider_rows_report_an_unreadable_store() {
+        let app = test_app_with_store(Arc::new(
+            light_factory_tui::credentials::FailingStore::default(),
+        ));
+        let rows = app.build_provider_rows();
+        let openai = rows.iter().find(|r| r.id == "openai").expect("listed");
+        assert_ne!(openai.key, RowKey::Absent);
+
+        // Ollama takes no API key, so a broken store must never label it "key store unavailable" —
+        // the special case in `build_provider_rows` had no test at all.
+        let ollama = rows.iter().find(|r| r.id == "ollama").expect("listed");
+        assert_ne!(ollama.key, RowKey::Unavailable);
+    }
+```
+
+- [ ] **Step 2: Make `rebuild`'s test env-independent.** `rebuild_carries_store_failures_into_the_provider_info`
+      genuinely FAILS with all four provider keys exported — reproduced by a reviewer — and its
+      `!is_empty()` assertion never checks which provider or which cause survived. Its doc comment
+      frames this as the same caveat the `App`-level tests carry, which is backwards: those are
+      written with `assert_ne!` precisely so they hold either way.
+
+      Give the startup path the seam `key_status_with` already has. In `selection.rs`, split
+      `build_selection` the way `resolve_key` is split:
+
+```rust
+/// Assemble the effective [`Selection`] from an explicit base, plus any store failure encountered.
+/// The base is supplied so a test can pin the outcome without the process environment deciding it.
+fn build_selection_from(
+    base: Selection,
+    settings: &Settings,
+    store: &dyn CredentialStore,
+) -> (Selection, Vec<StoreFailure>) {
+    apply_preferences(base, settings, store)
+}
+
+/// The effective [`Selection`] for the running process: the environment, then the stored keys and
+/// persisted preferences layered on top.
+pub fn build_selection(
+    settings: &Settings,
+    store: &dyn CredentialStore,
+) -> (Selection, Vec<StoreFailure>) {
+    build_selection_from(selection_from_env(), settings, store)
+}
+```
+
+      and the same for `rebuild` / `rebuild_from`. Then rewrite the test against `rebuild_from` with
+      an explicit empty base and assert what actually survives:
+
+```rust
+    /// Driven from an explicit base so the process environment cannot decide the outcome: with all
+    /// four provider keys exported the ambient form silently recorded no failures at all.
+    #[test]
+    fn rebuild_carries_store_failures_into_the_provider_info() {
+        let broken = FailingStore::new("no D-Bus session");
+        let (_provider, info) = rebuild_from(Selection::default(), &settings(None), &broken);
+        assert_eq!(info.store_failures.len(), REMOTE_IDS.len());
+        assert!(info.store_failures.iter().all(|f| f.error == "no D-Bus session"));
+        assert!(info.store_failures.iter().any(|f| f.provider == "openai"));
+    }
+```
+
+      `main.rs` and `app.rs` keep calling `rebuild`, so neither needs an edit — confirm that.
+
+- [ ] **Step 3: Render the store-failure credentials step end to end.** The existing
+      `the_credentials_step_renders_the_remedy_and_no_input_box` covers the `Auth` class and exists
+      because a long real message once pushed the remedy off screen (#57). `StoreUnavailable`'s
+      message is the composed sentence *plus* the keyring's own text — a longer line hitting the same
+      sizing path — and has no equivalent. Add the mirror test in `app.rs`, driving
+      `handle_models_fetched` with a realistic ~110-character store error, rendering at 80x20, and
+      asserting the remedy text and the provider are both on screen and `/key` is not.
+
+- [ ] **Step 4: Pin the modal's cap on the store path.** Remove `summarize_provider_error` from
+      `fetch_model_list_inner` today and every test still passes. In `modal.rs`:
+
+```rust
+    /// The composed sentence carries the keyring's own text, which a hostile or merely verbose
+    /// backend controls the length of. Uncapped it displaces the modal's own remedy row.
+    #[tokio::test]
+    async fn a_verbose_store_error_is_capped_before_it_reaches_the_modal() {
+        let store = light_factory_tui::credentials::FailingStore::new("x".repeat(1000));
+        let err = fetch_model_list("local", None, &store, Locale::En)
+            .await
+            .expect_err("an unreadable store cannot produce a model list");
+        assert!(err.message.chars().count() <= PROVIDER_ERROR_MAX_CHARS + 1);
+        assert!(err.message.contains("local"), "the provider survives the cut: {}", err.message);
+    }
+```
+
+- [ ] **Step 5a: Restore the remedy-text guard Task 8 left unowned.** Deleting
+      `a_store_failure_gets_its_own_remedy` dropped the only assertion that the store remedy's *text*
+      names the provider and mentions neither `/key` nor `/connect` — the whole point of it being a
+      separate remedy. `models.store_remedy` is now guarded only by the catalog's existence and
+      mirroring tests, so that string could be edited to recommend `/connect` and nothing would
+      object. Add to `modal.rs`'s `every_credential_class_names_its_own_remedy`:
+
+```rust
+        let store = i18n::t_with(
+            Locale::En,
+            FetchFailure::StoreUnavailable.remedy_key().expect("a credential class"),
+            &[("provider", "openai")],
+        );
+        assert!(store.contains("openai"), "the remedy names the provider: {store}");
+        assert!(
+            !store.contains("/key") && !store.contains("/connect"),
+            "both write to the store that just failed: {store}"
+        );
+```
+
+- [ ] **Step 5: One more wiring assertion.** In `selection.rs`'s
+      `key_status_with_classifies_every_wiring_outcome`, add the composition the two new rules leave
+      untested — an empty env value falling through to a *broken* store:
+
+```rust
+        assert_eq!(key_status_with("openai", &broken, blank), KeyStatus::Unavailable);
+```
+
+- [ ] **Step 6: Correct six comments that make claims the code does not support.**
+
+  1. `app.rs`, the store-failure routing test: drop the hardcoded `app.rs:2147` — the `open` helper
+     is not at that line, and line numbers in comments rot on the next edit. Say "that is what the
+     `open` helper above exists for".
+  2. `selection.rs` `read_store`: Task 10 Step 6 applies the cap here, so replace "the length cap
+     belongs to the modal, which already owns it" with a statement that the cap is applied at the
+     seam and the modal narrows it further.
+  3. `selection.rs` `rebuild_carries_store_failures_into_the_provider_info`: Task 11 Step 2 removes
+     the env dependence, so delete the caveat paragraph entirely and say why the base is explicit.
+  4. `app.rs` `build_provider_rows`: "`LIGHT_OLLAMA` is the whole of its configuration" is false —
+     `crates/providers` also reads `LIGHT_OLLAMA_MODEL`. Keep only the load-bearing half: ollama
+     takes no API key, so the credential store is never consulted for it.
+  5. `text.rs` `one_line`: Task 10 Step 7 rewrites this. The newline hazard is the engine log's
+     `Text` split, not the modal's `Line`.
+  6. `modal.rs`, above the `Credentials` render arm: "the remote-supplied error" is now wrong — this
+     arm also renders `StoreUnavailable`, whose text comes from the OS credential store, and
+     `MissingKey`, whose text is our own i18n string. Say "the foreign error text (a provider's or
+     the credential store's)".
+
+  Also, where it is one clause: note on `SetFailsStore` why it is not the library's `FailingStore`
+  (it needs `get` to succeed while `set` fails, a shape `FailingStore` cannot produce); name
+  `draw_popup` as the source of the i18n width test's `58` and say the provider id is duplicated by
+  hand from `app.rs`; and rename `resolve_key_delegates_to_the_process_env_reader`, whose own doc
+  says `process_env` is never consulted, to `resolve_key_reads_the_store_for_a_provider_with_no_env_var`.
+
+- [ ] **Step 7:** `cargo test -p light-factory-tui`,
+      `OPENAI_API_KEY=sk-test cargo test -p light-factory-tui`, and
+      `ANTHROPIC_API_KEY=a OPENAI_API_KEY=b GEMINI_API_KEY=c DEEPSEEK_API_KEY=d cargo test -p light-factory-tui`
+      — all three must pass, the third being the one that fails today. Then `cargo test --workspace`,
+      clippy, `cargo fmt --all`. Commit as
+      `tui: pin the store-failure state mappings and drop the tests' environment dependence`.
