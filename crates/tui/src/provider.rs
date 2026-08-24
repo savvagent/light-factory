@@ -69,12 +69,9 @@ impl ProviderInfo {
     /// warnings, one line per unreadable credential store, then the offline notice if it is
     /// offline.
     ///
-    /// The offline line is substituted only for [`OfflineReason::NothingConfigured`], and only
-    /// when a store actually failed: that is the one case where the alternative notice would be a
-    /// lie. With an unreadable store you cannot know whether a key existed, so "no provider
-    /// configured" states as fact the very thing the failure left unknown. Overwriting another
-    /// reason would repeat the defect this exists to fix, in the other direction, and the store
-    /// failure is reported on its own line above it either way.
+    /// The offline line is substituted exactly when [`ProviderInfo::store_caused_offline`] says
+    /// the store is why there is no key, and it becomes *two* lines — cause and remedy — because
+    /// the surface truncates.
     ///
     /// [`OfflineReason::NamedProviderMissingKey`] is the imprecise corner: `LIGHT_REMOTE_PROVIDER`
     /// naming a provider whose stored key could not be read still reports "{key} is not set",
@@ -85,17 +82,26 @@ impl ProviderInfo {
         // A locked wallet or a dead session bus fails every entry with the same words, so the
         // per-provider form would be four rows saying one thing. Keep it only when the causes
         // actually differ, which is the partial failure `KeyringStore`'s per-entry reads allow.
-        match self.store_failures.split_first() {
-            None => {}
-            Some((first, rest)) if rest.iter().all(|f| f.error == first.error) => {
+        //
+        // The lone failure is its own arm on purpose. `split_first` leaves an empty `rest`, and
+        // `rest.iter().all(..)` is vacuously true on it, so one failure used to take the collapsed
+        // branch and lose the provider name — in exactly the case where naming it matters most.
+        match self.store_failures.as_slice() {
+            [] => {}
+            [only] => lines.push(i18n::t_with(
+                locale,
+                "provider.store.unavailable",
+                &[("provider", &only.provider), ("error", &only.error)],
+            )),
+            [first, rest @ ..] if rest.iter().all(|f| f.error == first.error) => {
                 lines.push(i18n::t_with(
                     locale,
                     "provider.store.unavailable_all",
                     &[("error", &first.error)],
                 ));
             }
-            Some(_) => {
-                for failure in &self.store_failures {
+            all => {
+                for failure in all {
                     lines.push(i18n::t_with(
                         locale,
                         "provider.store.unavailable",
@@ -105,23 +111,39 @@ impl ProviderInfo {
             }
         }
         if let Some(reason) = &self.offline {
-            let store_caused = !self.store_failures.is_empty()
-                && match reason {
-                    // The store is the only reason here that can be *why* `keys` is empty.
-                    OfflineReason::NothingConfigured => true,
-                    // These carry their own cause; overwriting one would repeat the defect this
-                    // exists to fix, in the other direction. The failure is already on its own
-                    // line above.
-                    OfflineReason::NamedProviderMissingKey { .. }
-                    | OfflineReason::BaseUrlRejected { .. } => false,
-                };
-            lines.push(if store_caused {
-                i18n::t(locale, "provider.offline.store_unavailable").to_string()
+            if self.store_caused_offline().is_empty() {
+                lines.push(offline_notice(locale, reason));
             } else {
-                offline_notice(locale, reason)
-            });
+                // Two lines, not one sentence: `draw_engine` renders each line as a `ListItem` in
+                // a ratatui `List`, which truncates rather than wraps. A remedy appended to the
+                // cause is a remedy the user never sees.
+                lines.push(i18n::t(locale, "provider.offline.store_unavailable").to_string());
+                lines.push(i18n::t(locale, "provider.offline.store_remedy").to_string());
+            }
         }
         lines
+    }
+
+    /// The store failures, but only when the store is why there is no key.
+    ///
+    /// `notices` and `/models` both have to answer this, and answering it twice is how they
+    /// drifted apart: one branched exhaustively on the reason, the other ignored it entirely and
+    /// told a user whose `*_BASE_URL` was rejected to unlock a keyring that was never in the way.
+    ///
+    /// [`OfflineReason::NothingConfigured`] is the one reason the store can *cause*: with an
+    /// unreadable store you cannot know whether a key existed, so "no provider configured" states
+    /// as fact the very thing the failure left unknown. The other reasons carry their own cause,
+    /// and overwriting one would repeat that defect in the other direction — the failures are
+    /// still reported on their own lines above either way.
+    pub fn store_caused_offline(&self) -> &[StoreFailure] {
+        match self.offline {
+            Some(OfflineReason::NothingConfigured) => &self.store_failures,
+            Some(
+                OfflineReason::NamedProviderMissingKey { .. }
+                | OfflineReason::BaseUrlRejected { .. },
+            )
+            | None => &[],
+        }
     }
 }
 
@@ -167,7 +189,7 @@ mod tests {
     fn offline_notice_covers_each_reason() {
         assert_eq!(
             offline_notice(Locale::En, &OfflineReason::NothingConfigured),
-            "No provider configured — set ANTHROPIC_API_KEY (or another provider's key) or LIGHT_OLLAMA=1"
+            "No provider key — set ANTHROPIC_API_KEY or LIGHT_OLLAMA=1"
         );
         assert_eq!(
             offline_notice(
@@ -177,7 +199,7 @@ mod tests {
                     key: "OPENAI_API_KEY".into(),
                 }
             ),
-            "Provider 'openai' selected but OPENAI_API_KEY is not set — falling back to offline"
+            "Provider 'openai': OPENAI_API_KEY is not set — offline"
         );
         assert_eq!(
             offline_notice(
@@ -231,20 +253,21 @@ mod tests {
     /// The issue's third acceptance criterion: an offline fallback caused by an unreadable store
     /// must say so, instead of telling the user to set a key they already set.
     ///
-    /// A lone failure takes the collapsed branch, which names the cause but not the provider —
-    /// one provider failing with one cause is still "could not read the credential store". The
-    /// per-provider form is asserted by `differing_store_failures_are_reported_per_provider`.
+    /// A lone failure names the provider: `KeyringStore` reads per entry, so one item failing is
+    /// a real state, and it is the case where naming it matters most.
     #[test]
     fn a_store_failure_replaces_the_nothing_configured_notice() {
         let mut info = info(Some(OfflineReason::NothingConfigured), None);
         info.store_failures = vec![failure("openai")];
         let notices = info.notices(Locale::En);
         assert!(
-            notices.iter().any(|n| n.contains("locked")),
-            "the cause must be named: {notices:?}"
+            notices
+                .iter()
+                .any(|n| n.contains("openai") && n.contains("locked")),
+            "the provider and the cause must both be named: {notices:?}"
         );
         assert!(
-            !notices.iter().any(|n| n.contains("No provider configured")),
+            !notices.iter().any(|n| n.contains("No provider key")),
             "the nothing-configured notice is false here: {notices:?}"
         );
         assert!(
@@ -298,18 +321,24 @@ mod tests {
     }
 
     /// The substituted line replaced one that named a remedy. A broken keyring is exactly when an
-    /// environment variable helps, so the replacement must not be a dead end.
+    /// environment variable helps, so the replacement must not be a dead end — and the remedy gets
+    /// its own line, so `draw_engine`'s truncating `List` gives it a row of its own. That it
+    /// survives the render is asserted by `the_store_offline_remedy_survives_an_80_column_render`.
     #[test]
     fn the_store_offline_notice_still_names_a_remedy() {
         let mut info = info(Some(OfflineReason::NothingConfigured), None);
         info.store_failures = vec![failure("openai")];
-        let line = info
-            .notices(Locale::En)
-            .pop()
+        let notices = info.notices(Locale::En);
+        let remedy = notices
+            .last()
             .expect("an offline provider has an offline line");
         assert!(
-            line.contains("ANTHROPIC_API_KEY"),
-            "no remedy named: {line}"
+            remedy.contains("ANTHROPIC_API_KEY"),
+            "no remedy named: {notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("credential store")),
+            "the cause line is missing: {notices:?}"
         );
     }
 
@@ -329,10 +358,14 @@ mod tests {
         let notices = info.notices(Locale::En);
         assert_eq!(
             notices.len(),
-            2,
-            "one collapsed failure line plus the offline line: {notices:?}"
+            3,
+            "one collapsed failure line plus the offline cause and remedy: {notices:?}"
         );
         assert!(notices[0].contains("no D-Bus session"), "{notices:?}");
+        assert!(
+            !notices[0].contains("anthropic"),
+            "the collapsed line names no provider: {notices:?}"
+        );
     }
 
     #[test]

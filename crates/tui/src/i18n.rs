@@ -118,11 +118,11 @@ const EN: Catalog = &[
     ),
     (
         "provider.offline.nothing",
-        "No provider configured — set ANTHROPIC_API_KEY (or another provider's key) or LIGHT_OLLAMA=1",
+        "No provider key — set ANTHROPIC_API_KEY or LIGHT_OLLAMA=1",
     ),
     (
         "provider.offline.missing_key",
-        "Provider '{selector}' selected but {key} is not set — falling back to offline",
+        "Provider '{selector}': {key} is not set — offline",
     ),
     (
         "provider.offline.base_url",
@@ -138,7 +138,11 @@ const EN: Catalog = &[
     ),
     (
         "provider.offline.store_unavailable",
-        "Falling back to the offline provider: the credential store could not be read, so stored keys were unavailable. Unlock it and restart, or set ANTHROPIC_API_KEY (or another provider's key) in the environment.",
+        "Offline: the credential store could not be read.",
+    ),
+    (
+        "provider.offline.store_remedy",
+        "Unlock it and restart, or set ANTHROPIC_API_KEY.",
     ),
     ("status.ask_empty", "Usage: /ask <prompt>"),
     (
@@ -318,7 +322,7 @@ const EN: Catalog = &[
     ),
     (
         "models.store_remedy",
-        "Unlock the credential store and retry, or set {provider}'s API key in the environment",
+        "Unlock the credential store and retry, or set a provider's API key in the environment",
     ),
     (
         "models.footer_list",
@@ -434,11 +438,11 @@ const ES: Catalog = &[
     ),
     (
         "provider.offline.nothing",
-        "No hay proveedor configurado — define ANTHROPIC_API_KEY (o la clave de otro proveedor) o LIGHT_OLLAMA=1",
+        "Sin proveedor — define ANTHROPIC_API_KEY o LIGHT_OLLAMA=1",
     ),
     (
         "provider.offline.missing_key",
-        "Proveedor '{selector}' seleccionado pero {key} no está definida — usando modo sin conexión",
+        "Proveedor '{selector}': falta {key} — sin conexión",
     ),
     (
         "provider.offline.base_url",
@@ -454,7 +458,11 @@ const ES: Catalog = &[
     ),
     (
         "provider.offline.store_unavailable",
-        "Usando el proveedor sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales, as\u{ed} que las claves guardadas no estaban disponibles. Desbloqu\u{e9}alo y reinicia, o define ANTHROPIC_API_KEY (o la clave de otro proveedor) en el entorno.",
+        "Sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales.",
+    ),
+    (
+        "provider.offline.store_remedy",
+        "Desbloqu\u{e9}alo y reinicia, o define ANTHROPIC_API_KEY.",
     ),
     ("status.ask_empty", "Uso: /ask <indicación>"),
     (
@@ -667,7 +675,7 @@ const ES: Catalog = &[
     ),
     (
         "models.store_remedy",
-        "Desbloquea el almac\u{e9}n de credenciales y reintenta, o define la clave de API de {provider} en el entorno",
+        "Desbloquea el almac\u{e9}n de credenciales y reintenta, o define la clave de API de un proveedor en el entorno",
     ),
     (
         "models.footer_list",
@@ -805,6 +813,30 @@ mod tests {
                 columns <= INNER_WIDTH,
                 "{name} row is {columns} columns: {row}"
             );
+        }
+    }
+
+    /// `draw_engine` renders every `ProviderInfo::notices` line as a `ListItem` in a ratatui
+    /// `List`, which **truncates** rather than wraps — a long line loses its tail with no
+    /// ellipsis, and the tail is where the remedy is. `every_footer_fits_the_popup_in_both_locales`
+    /// gates `*.footer` only; these keys need the same guard for a different surface.
+    #[test]
+    fn every_provider_notice_fits_its_surfaces_in_both_locales() {
+        // The same 58 columns as the footer gate, and for the same reason: these keys also reach
+        // `draw_popup`'s 60-column box (`models_view` renders `offline_notice` there), which is
+        // narrower than `draw_engine`'s list at any usable terminal width. Budget for the narrower.
+        const INNER_WIDTH: usize = 58;
+        for (catalog, name) in [(EN, "EN"), (ES, "ES")] {
+            for (key, value) in catalog {
+                if !(key.starts_with("provider.offline.") || key.starts_with("provider.store.")) {
+                    continue;
+                }
+                let columns = value.chars().count();
+                assert!(
+                    columns <= INNER_WIDTH,
+                    "{name} {key} is {columns} columns; it is truncated at {INNER_WIDTH}: {value}"
+                );
+            }
         }
     }
 

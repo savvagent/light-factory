@@ -809,17 +809,39 @@ impl App {
     /// offline step — "use /connect first" — would send the user into a flow that writes to the
     /// same unreadable store. Report the store instead, on the step that carries a remedy and a
     /// Ctrl+R that re-reads it.
+    ///
+    /// Whether the store is the cause is [`ProviderInfo::store_caused_offline`]'s question, not
+    /// this function's: reading `store_failures` alone told a user whose `*_BASE_URL` had been
+    /// rejected to unlock a keyring that was never in the way.
+    ///
+    /// The message collapses the same way `notices` does, and for the same reason. Taking
+    /// `first()` named `anthropic` every time the whole store was down — the headline scenario —
+    /// so a DeepSeek user read a sentence about Anthropic. The active provider is no better a
+    /// name: the fallback has already happened, so it is `local`, which takes no key at all.
     fn offline_models_step(&self) -> ModelsStep {
-        let Some(failure) = self.provider_info.store_failures.first() else {
-            return ModelsStep::Offline;
+        let (error, provider) = match self.provider_info.store_caused_offline() {
+            [] => return ModelsStep::Offline,
+            // `KeyringStore` reads per entry, so one item failing is a real state — and the one
+            // where naming the provider matters most.
+            [only] => (
+                self.t_with(
+                    "provider.store.unavailable",
+                    &[("provider", &only.provider), ("error", &only.error)],
+                ),
+                only.provider.clone(),
+            ),
+            // Several failed, so no one provider is "the" cause. Say only what is true of all of
+            // them. Ctrl+R still re-reads the store through the first entry: it is the provider
+            // key precedence would select once the store answers again.
+            [first, ..] => (
+                self.t_with("provider.store.unavailable_all", &[("error", &first.error)]),
+                first.provider.clone(),
+            ),
         };
         ModelsStep::Credentials {
-            error: self.t_with(
-                "provider.store.unavailable",
-                &[("provider", &failure.provider), ("error", &failure.error)],
-            ),
+            error,
             class: FetchFailure::StoreUnavailable,
-            provider: failure.provider.clone(),
+            provider,
         }
     }
 
@@ -2545,7 +2567,7 @@ mod tests {
         let flat = flatten(&screen);
         assert!(
             flat.contains(&flatten(
-                "Unlock the credential store and retry, or set openai's API key in the environment"
+                "Unlock the credential store and retry, or set a provider's API key in the environment"
             )),
             "the store remedy is clipped:\n{screen}"
         );
@@ -3818,6 +3840,81 @@ mod tests {
             error.contains("openai") && error.contains("no D-Bus session"),
             "{error}"
         );
+    }
+
+    /// #51's remedy has to survive the render, not just the string. `draw_engine` puts each log
+    /// line in a `ListItem`, and a ratatui `List` truncates rather than wraps, with no ellipsis —
+    /// so round 2's 206-column sentence lost its whole remedy clause at every realistic width
+    /// while a `contains` assertion on the `String` still passed. Assert on the buffer instead.
+    ///
+    /// This drives the real `App::draw` in `Mode::Engine`, so the assertion covers the list the
+    /// user actually sees, borders and all.
+    #[test]
+    fn the_store_offline_remedy_survives_an_80_column_render() {
+        let mut app = test_app();
+        app.mode = Mode::Engine;
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.provider_info.store_failures = vec![crate::provider::StoreFailure {
+            provider: "openai".to_string(),
+            error: "locked".to_string(),
+        }];
+        app.engine_log = app.provider_info.notices(app.config.lang);
+        let screen = render(&mut app, 80, 12);
+        assert!(
+            screen.contains("credential store"),
+            "the cause is not on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("ANTHROPIC_API_KEY"),
+            "the remedy is not on screen:\n{screen}"
+        );
+    }
+
+    /// The headline scenario is *every* entry failing, not one. `store_failures.first()` is then
+    /// always `anthropic`, so a DeepSeek user read a sentence about Anthropic; the active provider
+    /// is `local` when the fallback has already happened, so it is not a name to substitute in
+    /// either. Nothing on the step may name a provider the user never chose.
+    #[test]
+    fn models_names_no_provider_when_the_whole_store_failed() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.provider_info.store_failures = crate::selection::REMOTE_IDS
+            .iter()
+            .map(|id| crate::provider::StoreFailure {
+                provider: id.to_string(),
+                error: "locked".to_string(),
+            })
+            .collect();
+        app.enter_models();
+        let Some(ModelsStep::Credentials { error, .. }) = models_step(&app) else {
+            panic!("expected the credentials step, got {:?}", models_step(&app));
+        };
+        assert!(error.contains("locked"), "{error}");
+        for id in crate::selection::REMOTE_IDS.iter().chain(["local"].iter()) {
+            assert!(!error.contains(id), "the message names {id}: {error}");
+        }
+        app.mode = Mode::Connected;
+        let screen = render(&mut app, 80, 24);
+        for id in crate::selection::REMOTE_IDS.iter().chain(["local"].iter()) {
+            assert!(!screen.contains(id), "the render names {id}:\n{screen}");
+        }
+    }
+
+    /// A rejected `*_BASE_URL` is its own cause. Telling the user to unlock the credential store
+    /// is advice that cannot work, and `ProviderInfo::notices` was hardened against exactly this
+    /// ten lines away — `store_caused_offline` is why both now answer the question the same way.
+    #[test]
+    fn models_does_not_blame_the_store_for_another_offline_reason() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::BaseUrlRejected {
+            var: "LIGHT_OPENAI_BASE_URL".to_string(),
+        });
+        app.provider_info.store_failures = vec![crate::provider::StoreFailure {
+            provider: "openai".to_string(),
+            error: "locked".to_string(),
+        }];
+        app.enter_models();
+        assert_eq!(models_step(&app), Some(&ModelsStep::Offline));
     }
 
     /// Offline for a reason that is not the store still gets the plain offline step.

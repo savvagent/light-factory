@@ -189,7 +189,8 @@ impl FetchFailure {
     pub(crate) fn remedy_key(self) -> Option<&'static str> {
         match self {
             // `/connect` and `/key` both write to the credential store, so neither is a remedy
-            // for a store that cannot be read.
+            // for a store that cannot be read. The remedy names no provider: a store failure can
+            // be the whole store, and the step then has no provider the user actually chose.
             FetchFailure::StoreUnavailable => Some("models.store_remedy"),
             FetchFailure::MissingKey | FetchFailure::Auth => Some("models.credentials_remedy"),
             FetchFailure::Fetch => None,
@@ -2404,8 +2405,13 @@ mod tests {
             &[("provider", "openai")],
         );
         assert!(
-            store.contains("openai"),
-            "the remedy names the provider: {store}"
+            store.contains("credential store"),
+            "the remedy names the cause: {store}"
+        );
+        // The whole store can fail at once, and then the step has no provider the user chose.
+        assert!(
+            !store.contains("openai"),
+            "the store remedy names no provider: {store}"
         );
         assert!(
             !store.contains("/key") && !store.contains("/connect"),
