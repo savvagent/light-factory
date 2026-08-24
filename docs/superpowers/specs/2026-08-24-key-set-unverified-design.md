@@ -313,10 +313,11 @@ all. Nothing on any of these paths calls `resolve_key`, so `OPENAI_API_KEY` in t
 environment is irrelevant to every assertion — `OPENAI_API_KEY=sk-test cargo test -p
 light-factory-tui` must be identical.
 
-1. `submitting_a_key_reports_it_as_unverified` — status is `status.key_stored_unverified`, and is
-   *not* the old "saved" sentence.
-2. `submitting_a_key_stores_it_and_starts_a_probe` — `store.get("openai")` returns the key;
-   `key_probe_nonce != 0`; `key_probe.is_some()`.
+1. `submitting_a_key_reports_it_as_stored_but_unverified` — status is
+   `status.key_stored_unverified`, and is *not* the old "saved" sentence. Also asserts
+   `store.get("openai")` returns the key, so the honest status is not bought by failing to store.
+2. `submitting_a_key_starts_a_probe` — `key_probe_nonce != 0`; `key_probe.is_some()`. The store
+   assertion lives in test 1 rather than being repeated here.
 3. `a_failed_keyring_write_starts_no_probe` — a failing store double leaves `key_probe.is_none()`
    and `key_probe_nonce == 0`.
 4. `an_accepted_key_reports_verification` — `handle_key_probed(nonce, "openai", Ok(()))` ⇒
