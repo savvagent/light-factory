@@ -204,7 +204,27 @@ const EN: Catalog = &[
         "status.model_unsupported",
         "The active provider has no model to set",
     ),
-    ("status.key_set", "API key saved for {provider}"),
+    (
+        "status.key_stored_unverified",
+        "API key stored for {provider} \u{2014} not yet verified",
+    ),
+    ("status.key_verified", "{provider} accepted the API key"),
+    (
+        "status.key_verified_shadowed",
+        "{provider} accepted the key \u{2014} but {var} is used",
+    ),
+    (
+        "status.key_rejected",
+        "{provider} rejected the API key \u{2014} it is still stored",
+    ),
+    (
+        "status.key_unresolved",
+        "No API key resolved for {provider} \u{2014} nothing was checked",
+    ),
+    (
+        "status.key_unreachable",
+        "Couldn't reach {provider} to check the key \u{2014} it is stored",
+    ),
     ("status.key_cleared", "API key cleared for {provider}"),
     (
         "status.key_failed",
@@ -513,7 +533,27 @@ const ES: Catalog = &[
         "status.model_unsupported",
         "El proveedor activo no tiene modelo que configurar",
     ),
-    ("status.key_set", "Clave de API guardada para {provider}"),
+    (
+        "status.key_stored_unverified",
+        "Clave de API guardada para {provider} \u{2014} aún sin verificar",
+    ),
+    ("status.key_verified", "{provider} aceptó la clave de API"),
+    (
+        "status.key_verified_shadowed",
+        "{provider} aceptó la clave, pero se usará {var}",
+    ),
+    (
+        "status.key_rejected",
+        "{provider} rechazó la clave de API \u{2014} sigue guardada",
+    ),
+    (
+        "status.key_unresolved",
+        "No se resolvió ninguna clave para {provider} \u{2014} sin verificar",
+    ),
+    (
+        "status.key_unreachable",
+        "No se pudo contactar con {provider} \u{2014} sigue guardada",
+    ),
     (
         "status.key_cleared",
         "Clave de API eliminada para {provider}",
@@ -735,6 +775,40 @@ mod tests {
                 assert!(
                     columns <= INNER_WIDTH,
                     "{name} {key} is {columns} columns; it is truncated at {INNER_WIDTH}: {value}"
+                );
+            }
+        }
+    }
+
+    /// The `/key` outcome statuses render in the title row as ` light-factory \u{b7} {status}`, one
+    /// unwrapped `Paragraph`. Anything past the terminal width is hard-truncated, and what sits at
+    /// the end of these particular lines is the qualification that makes them honest — "it is still
+    /// stored", "but {var} is used". Losing that tail turns each one back into the confident
+    /// half-sentence #61 exists to remove, so the budget is checked rather than eyeballed.
+    ///
+    /// Measured against the longest provider id and environment variable the catalog can carry, so
+    /// the assertion holds for every provider rather than for the one a developer happened to try.
+    #[test]
+    fn every_key_outcome_status_fits_an_eighty_column_title_row() {
+        // ` light-factory \u{b7} ` is 17 columns; 80 is the narrowest terminal the TUI targets.
+        const BUDGET: usize = 80 - 17;
+        const PROVIDER: &str = "anthropic";
+        const VAR: &str = "ANTHROPIC_API_KEY";
+        for (locale, name) in [(Locale::En, "EN"), (Locale::Es, "ES")] {
+            for key in [
+                "status.key_stored_unverified",
+                "status.key_verified",
+                "status.key_verified_shadowed",
+                "status.key_rejected",
+                "status.key_unresolved",
+                "status.key_unreachable",
+                "status.key_cleared",
+            ] {
+                let line = t_with(locale, key, &[("provider", PROVIDER), ("var", VAR)]);
+                let columns = line.chars().count();
+                assert!(
+                    columns <= BUDGET,
+                    "{name} {key} is {columns} columns; it is truncated at {BUDGET}: {line}"
                 );
             }
         }

@@ -64,6 +64,13 @@ pub enum UiEvent {
         provider: String,
         result: Result<Vec<String>, FetchError>,
     },
+    /// The verification probe for a key `/key` has just stored. Carries no model list: `/key` has
+    /// no renderer for one, and not carrying it keeps a provider-supplied payload off this path.
+    KeyProbed {
+        nonce: u64,
+        provider: String,
+        result: Result<(), FetchError>,
+    },
 }
 
 /// Which field currently owns keyboard input.
@@ -116,6 +123,17 @@ pub struct App {
     key_target: Option<String>,
     key_input: String,
     key_return: Mode,
+    /// Generation of the most recent `/key` verification probe. A second `/key` submitted while the
+    /// first probe is still in flight bumps this, so the older result — which answers a question
+    /// the user has already replaced — fails the check in [`App::handle_key_probed`] and is
+    /// discarded rather than overwriting a newer status. Starts at 0 and is incremented *before*
+    /// use, so no live probe ever carries nonce 0.
+    key_probe_nonce: u64,
+    /// The in-flight `/key` verification probe, if any. Held so [`App::next_key_probe_nonce`] can
+    /// abort it: the request carries an API key in its headers, and two probes in flight is two
+    /// keys in flight. Deliberately not inside [`ModalHost`] — `/key` is `Mode::Key`, a screen, and
+    /// the modal host's nonce exists to discard results that outlive their *modal*.
+    key_probe: Option<tokio::task::JoinHandle<()>>,
     /// The one overlay that owns the keyboard, if any, together with its fetch generation and
     /// cancellation handle. One field, not six: "two modals open at once" is unrepresentable.
     modal: ModalHost,
@@ -169,6 +187,8 @@ impl App {
             settings: settings.settings,
             settings_path: settings.path,
             key_target: None,
+            key_probe_nonce: 0,
+            key_probe: None,
             key_input: String::new(),
             key_return: Mode::SignIn,
             modal: ModalHost::default(),
@@ -479,7 +499,14 @@ impl App {
         match self.store.set(&provider, &key) {
             Ok(()) => {
                 self.rebuild_provider();
-                self.status = self.t_with("status.key_set", &[("provider", &provider)]);
+                // The floor, set unconditionally and before the probe exists: if nothing ever
+                // comes back — the process dies, the next `/key` aborts this one, the fetch hangs
+                // to its deadline — "not yet verified" is still exactly true. The probe below only
+                // ever replaces this with a sharper sentence, so the honesty of the status never
+                // depends on a network round-trip landing (#61).
+                self.status =
+                    self.t_with("status.key_stored_unverified", &[("provider", &provider)]);
+                self.begin_key_probe(provider, key);
             }
             Err(e) => {
                 let error = e.to_string();
@@ -488,6 +515,160 @@ impl App {
                     &[("provider", &provider), ("error", &error)],
                 ));
             }
+        }
+    }
+
+    /// Claim the next `/key` probe generation, cancelling and invalidating whatever probe was in
+    /// flight.
+    ///
+    /// Bumping and aborting are one operation for the reason [`ModalHost::next_fetch_nonce`] gives:
+    /// they are the same event, so no call site can perform one and forget the other — and
+    /// forgetting the abort would leave a request carrying the previous API key in its headers
+    /// running against an answer nobody will read.
+    ///
+    /// `wrapping_add` because a `u64` count of `/key` submissions cannot realistically wrap, and a
+    /// panic there would be a worse outcome than a reused generation.
+    fn next_key_probe_nonce(&mut self) -> u64 {
+        self.key_probe_nonce = self.key_probe_nonce.wrapping_add(1);
+        if let Some(previous) = self.key_probe.take() {
+            previous.abort();
+        }
+        self.key_probe_nonce
+    }
+
+    /// Cancel and invalidate any in-flight `/key` verification probe.
+    ///
+    /// The seam for "the state this probe describes no longer holds". A probe answers one question
+    /// — *does the provider accept the key we just stored for it?* — and every part of that
+    /// question can be revoked while the answer is still in flight: the key can be cleared, the
+    /// session can end, the socket can drop. Without a single named call, each new teardown path
+    /// silently omits the probe: [`Self::next_key_probe_nonce`] had exactly one caller, so its
+    /// "bump and abort are one operation" rule was satisfied vacuously and said nothing about
+    /// whether every path that *should* cancel actually does.
+    ///
+    /// Bumping the generation is what discards a result already on the event channel; the abort
+    /// inside is what stops the request still carrying the API key. Both matter, and they are one
+    /// call for the reason they are one operation.
+    ///
+    /// Deliberately **not** hung on [`Self::dismiss_modals`]: `enter` calls that on the
+    /// sign-in-to-connected transition, and a probe started by a `/key` run before sign-in is
+    /// still answering a live question there.
+    fn cancel_key_probe(&mut self) {
+        self.next_key_probe_nonce();
+    }
+
+    /// Cancel every credential-bearing task the ending session leaves behind.
+    ///
+    /// The two cancellations sign-out and socket loss must both perform, named once so neither
+    /// site can acquire the other's bug. Both are requests holding an API key in memory and on the
+    /// wire, and both would otherwise land on a screen that has already been replaced — the model
+    /// fetch under a dismissed modal, the `/key` probe over `status.disconnected` or the sign-in
+    /// screen's status.
+    ///
+    /// Separate from [`Self::dismiss_modals`] rather than folded into it: `enter` dismisses modals
+    /// on a transition that ends no session, and must not cancel a live `/key` probe.
+    fn cancel_session_tasks(&mut self) {
+        self.dismiss_modals();
+        self.cancel_key_probe();
+    }
+
+    /// Ask the provider whether the key just stored is one it accepts, off the UI loop.
+    ///
+    /// The probe is a model-list fetch because that is what the codebase has, what `/connect`
+    /// already runs after its own key entry, and what #55 already classifies into
+    /// [`FetchFailure`] — so `/key` and `/connect` now agree about whether they checked.
+    ///
+    /// `Some(key)` is load-bearing, never `None`: `None` would let `fetch_model_list` call
+    /// `resolve_key`, which prefers an exported `OPENAI_API_KEY` over the keyring, and the user
+    /// would be told the key they just typed was accepted on the strength of a different
+    /// credential entirely.
+    ///
+    /// The model list is discarded at the boundary — `/key` has no use for it.
+    fn begin_key_probe(&mut self, provider: String, key: String) {
+        let nonce = self.next_key_probe_nonce();
+        let events = self.events.clone();
+        let store = self.store.clone();
+        let lang = self.config.lang;
+        self.key_probe = Some(tokio::spawn(async move {
+            let result = fetch_model_list(&provider, Some(key), store.as_ref(), lang)
+                .await
+                .map(|_| ());
+            let _ = events.send(UiEvent::KeyProbed {
+                nonce,
+                provider,
+                result,
+            });
+        }));
+    }
+
+    /// Replace the stored-unverified status with what the probe actually learned.
+    ///
+    /// The key is never un-stored, on any outcome: a 401 can come from an auth-edge outage, an IP
+    /// allowlist, or an org-level block as easily as from a bad credential, and `/key <provider>
+    /// clear` is the user's to run. The status carries the news; the store carries their intent.
+    ///
+    /// [`FetchError::message`] is deliberately not interpolated. It is provider-supplied text on a
+    /// path whose whole subject is a live credential, so every `/key` status takes `{provider}` and
+    /// nothing else.
+    fn handle_key_probed(&mut self, nonce: u64, provider: String, result: Result<(), FetchError>) {
+        if nonce != self.key_probe_nonce {
+            return;
+        }
+        // The nonce matched, so this is the current probe's own result and that task is done.
+        self.key_probe = None;
+        let Err(e) = &result else {
+            let source = crate::selection::key_status(&provider, self.store.as_ref());
+            self.status = self.key_verified_status(&provider, source);
+            return;
+        };
+        // An exhaustive match rather than `FetchFailure::needs_credentials`, which is the *modal's*
+        // question ("is there a credential-shaped remedy?") and not this one ("what did we learn
+        // about the key the user just typed?"). The two answers already diverge: `MissingKey`
+        // needs credentials but is not a rejection, and a class added to that predicate later
+        // would silently inherit the accusation. Matching every variant here makes a new class a
+        // compile error at the place that has to word it.
+        let status = match e.class {
+            // The provider answered, and refused the credential we sent it.
+            FetchFailure::Auth => "status.key_rejected",
+            // No key reached the request at all, so nothing was tested. `/key` always probes with
+            // `Some(key)`, so this is unreachable today — which is exactly why it must not quietly
+            // borrow the rejection wording if that ever changes.
+            FetchFailure::MissingKey => "status.key_unresolved",
+            // DNS, TLS, a timeout, a 5xx, a panic: says nothing about the key.
+            FetchFailure::Fetch => "status.key_unreachable",
+        };
+        self.status = self.t_with(status, &[("provider", &provider)]);
+    }
+
+    /// The sentence for a probe the provider accepted, given where the key that requests will
+    /// *actually* use comes from.
+    ///
+    /// The probe deliberately sends the key the user just typed, so "accepted" is a true statement
+    /// about that string and a misleading one about the process: [`crate::selection::resolve_key`]
+    /// prefers an exported `OPENAI_API_KEY` over the keyring for all real traffic, so a developer
+    /// with one set would read a green confirmation and then bill a different account on every
+    /// request. The failure has no error to surface — the shadowing key works — so the status is
+    /// the only place it can be said.
+    ///
+    /// Takes `source` rather than reading it, so both arms are testable without the ambient
+    /// environment deciding which one runs.
+    ///
+    /// The match is exhaustive on purpose: a new [`crate::selection::KeyStatus`] variant is a
+    /// decision about whether "accepted" is still the honest word, and should stop the build here
+    /// rather than fall through to the stronger claim.
+    fn key_verified_status(&self, provider: &str, source: crate::selection::KeyStatus) -> String {
+        let shadowing = match source {
+            // `Env` is returned only when that variable holds a non-empty value, so the name is
+            // always available; the `Option` is `env_key_var`'s, not a doubt about this arm.
+            crate::selection::KeyStatus::Env => light_factory_providers::env_key_var(provider),
+            crate::selection::KeyStatus::Keyring | crate::selection::KeyStatus::None => None,
+        };
+        match shadowing {
+            Some(var) => self.t_with(
+                "status.key_verified_shadowed",
+                &[("provider", provider), ("var", var)],
+            ),
+            None => self.t_with("status.key_verified", &[("provider", provider)]),
         }
     }
 
@@ -990,6 +1171,12 @@ impl App {
         }
         match self.store.delete(provider) {
             Ok(()) => {
+                // The key the probe is asking about is gone, so every sentence it could still
+                // produce is now false — "accepted" describes a key we no longer hold, and both
+                // failure arms end in "it is still stored". Cancelled here rather than filtered by
+                // provider: a probe for some *other* provider is only a status the user has to
+                // read twice, and losing it costs nothing but the floor they already have.
+                self.cancel_key_probe();
                 self.rebuild_provider();
                 self.status = self.t_with("status.key_cleared", &[("provider", provider)]);
             }
@@ -1228,8 +1415,8 @@ impl App {
     async fn sign_out(&mut self) {
         // Before the logout await, not after. `self.api` is a `reqwest::Client::new()` with no
         // timeout, so a server that never answers `logout` would otherwise delay cancellation of
-        // the key-bearing model fetch indefinitely — the exact window the abort exists to close.
-        self.dismiss_modals();
+        // the key-bearing requests indefinitely — the exact window the abort exists to close.
+        self.cancel_session_tasks();
         if let Some(session) = &self.session {
             let _ = self.api.logout(&session.token).await;
         }
@@ -1267,7 +1454,10 @@ impl App {
                     self.session = None;
                     self.mode = Mode::SignIn;
                     self.focus = Focus::Email;
-                    self.dismiss_modals();
+                    // After `self.status` is set, and cancelling the `/key` probe is why the order
+                    // is safe either way: a late probe result would otherwise overwrite
+                    // `status.disconnected` with a sentence about a session that is gone.
+                    self.cancel_session_tasks();
                     self.error = Some(text);
                 }
             }
@@ -1807,6 +1997,11 @@ pub async fn run(
                         provider,
                         result,
                     } => app.handle_models_fetched(nonce, provider, result),
+                    UiEvent::KeyProbed {
+                        nonce,
+                        provider,
+                        result,
+                    } => app.handle_key_probed(nonce, provider, result),
                 }
             }
             _ = tick.tick() => {
@@ -2049,6 +2244,21 @@ mod tests {
             Ok(())
         }
     }
+
+    /// A provider id whose verification probe cannot reach a socket, for the tests that let
+    /// `submit_key_entry` spawn one.
+    ///
+    /// No test may reach the network, and the `/key` tests hold to that by never awaiting after
+    /// the spawn — nothing drives the current-thread runtime's queue, so the probe is dropped
+    /// unpolled. That is a property of how the tests are written, enforced by nothing. This makes
+    /// it a property of the task instead: `local` is not `ollama`, so `fetch_model_list` reaches
+    /// `list_models`, which resolves a base URL first and bails on an unknown provider before any
+    /// request is built. `env_key_var("local")` is also `None`, so nothing here depends on the
+    /// ambient environment either.
+    ///
+    /// `submit_key_entry` never consults `takes_key` — that guard lives in `enter_key_entry` — so
+    /// the path under test is the same one `/key openai` takes.
+    const PROBE_SAFE_PROVIDER: &str = "local";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -3642,6 +3852,340 @@ mod tests {
             Some(ConnectStep::KeyEntry { .. })
         ));
         assert!(app.error.is_some());
+    }
+
+    /// `store.set` returning `Ok` means the OS keyring accepted a string, not that the provider
+    /// will accept it as a credential — so the status must not read as verification (#61).
+    ///
+    /// A `tokio::test` because `submit_key_entry` spawns the verification probe, and the body
+    /// deliberately never awaits: on the current-thread test runtime nothing drives the run queue
+    /// between the spawn and the end of the test, so the probe is dropped unpolled and no request
+    /// is issued.
+    ///
+    /// That property is a convention, though, and one `.await` added here later would quietly
+    /// break it — so [`PROBE_SAFE_PROVIDER`] makes it structural as well: the spawned task cannot
+    /// open a socket whatever polls it.
+    ///
+    /// Env-independent, but not because the path avoids the environment — `rebuild_provider` reads
+    /// `OPENAI_API_KEY` and friends through `selection_from_env`. It is independent because that
+    /// read reaches only `provider`/`provider_info`, and neither assertion here touches them. A
+    /// future assertion on `provider_info` would need its own isolation.
+    #[tokio::test]
+    async fn submitting_a_key_reports_it_as_stored_but_unverified() {
+        let mut app = test_app();
+        app.key_target = Some(PROBE_SAFE_PROVIDER.to_string());
+        app.key_input = "sk-test-key".to_string();
+
+        app.submit_key_entry();
+
+        assert_eq!(
+            app.status,
+            "API key stored for local \u{2014} not yet verified"
+        );
+        assert_eq!(
+            app.store.get(PROBE_SAFE_PROVIDER).unwrap().as_deref(),
+            Some("sk-test-key"),
+            "the key must still be written to the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn submitting_a_key_starts_a_probe() {
+        let mut app = test_app();
+        app.key_target = Some(PROBE_SAFE_PROVIDER.to_string());
+        app.key_input = "sk-test-key".to_string();
+
+        app.submit_key_entry();
+
+        assert_ne!(
+            app.key_probe_nonce, 0,
+            "the probe generation must be bumped"
+        );
+        assert!(app.key_probe.is_some(), "the probe must be tracked");
+    }
+
+    /// Nothing was stored, so there is nothing to verify — and a probe here would send the key the
+    /// keyring just refused to hold.
+    #[tokio::test]
+    async fn a_failed_keyring_write_starts_no_probe() {
+        let mut app = test_app_with_store(Arc::new(FailingStore));
+        app.key_target = Some("openai".to_string());
+        app.key_input = "sk-test-key".to_string();
+
+        app.submit_key_entry();
+
+        assert!(app.error.is_some(), "the failure must be surfaced");
+        assert!(app.key_probe.is_none());
+        assert_eq!(app.key_probe_nonce, 0);
+    }
+
+    /// The wiring from a successful probe to the accepted status.
+    ///
+    /// Runs against [`PROBE_SAFE_PROVIDER`] so the assertion holds under both suite variants: this
+    /// arm now consults `key_status`, and for a provider with a declared env var the answer — and
+    /// therefore the sentence — depends on whether the developer (or CI) has that variable
+    /// exported. `local` declares none, so `key_status` can never return `Env` for it. The two
+    /// sentences themselves are covered directly below, without the environment in the loop.
+    #[test]
+    fn an_accepted_key_reports_verification() {
+        let mut app = test_app();
+        app.key_probe_nonce = 7;
+
+        app.handle_key_probed(7, PROBE_SAFE_PROVIDER.to_string(), Ok(()));
+
+        assert_eq!(app.status, "local accepted the API key");
+        assert!(app.key_probe.is_none());
+    }
+
+    /// "Accepted" is a claim about the provider; the old "saved" was a claim about a keyring. When
+    /// an exported variable shadows the keyring, the stronger claim is true of a string that no
+    /// later request will send — `resolve_key` prefers the environment — so a valid key for a
+    /// different account bills the wrong org behind a green confirmation. The status must name the
+    /// variable that actually wins (#61 review, and the reason #60 exists).
+    #[test]
+    fn an_accepted_key_names_the_variable_that_shadows_it() {
+        let app = test_app();
+
+        let status = app.key_verified_status("openai", crate::selection::KeyStatus::Env);
+
+        assert_eq!(
+            status,
+            "openai accepted the key \u{2014} but OPENAI_API_KEY is used"
+        );
+    }
+
+    /// The other side of the same call: with nothing shadowing it, the key just stored is the key
+    /// that will be used, and the plain confirmation is exactly true.
+    #[test]
+    fn an_accepted_key_with_nothing_shadowing_it_reports_plain_verification() {
+        let app = test_app();
+
+        for source in [
+            crate::selection::KeyStatus::Keyring,
+            crate::selection::KeyStatus::None,
+        ] {
+            assert_eq!(
+                app.key_verified_status("openai", source),
+                "openai accepted the API key"
+            );
+        }
+    }
+
+    /// A rejected key is still the key the user asked us to hold: a 401 can come from an auth-edge
+    /// outage as easily as from a bad credential, so the status carries the news and the store
+    /// keeps the user's intent (#61).
+    #[test]
+    fn a_rejected_key_reports_rejection_and_stays_stored() {
+        let store = Arc::new(MemStore::new());
+        store.set("openai", "sk-test-key").unwrap();
+        let mut app = test_app_with_store(store);
+        app.key_probe_nonce = 7;
+
+        app.handle_key_probed(
+            7,
+            "openai".to_string(),
+            Err(FetchError {
+                class: FetchFailure::Auth,
+                message: "openai: 401".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            app.status,
+            "openai rejected the API key \u{2014} it is still stored"
+        );
+        assert_eq!(
+            app.store.get("openai").unwrap().as_deref(),
+            Some("sk-test-key"),
+            "a rejected key must not be un-stored"
+        );
+    }
+
+    /// `MissingKey` means no key reached the request at all — the provider was never asked, so it
+    /// refused nothing. Routing it through `FetchFailure::needs_credentials` said "rejected",
+    /// which is a different and untrue sentence; the same predicate is being widened to cover a
+    /// keyring that could not be read, which would make `/key` announce a rejection for a store
+    /// failure. `/key` words its own outcomes instead (#61 review).
+    #[test]
+    fn a_missing_key_class_is_not_reported_as_a_rejection() {
+        let mut app = test_app();
+        app.key_probe_nonce = 7;
+
+        app.handle_key_probed(
+            7,
+            "openai".to_string(),
+            Err(FetchError {
+                class: FetchFailure::MissingKey,
+                message: "no key".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            app.status,
+            "No API key resolved for openai \u{2014} nothing was checked"
+        );
+        assert!(
+            !app.status.contains("rejected"),
+            "nothing was sent, so nothing was refused"
+        );
+    }
+
+    /// A timeout, a DNS failure, or a 5xx says nothing about the key, so the status must not accuse
+    /// it — and must stay distinct from the rejection wording.
+    #[test]
+    fn an_unreachable_provider_does_not_accuse_the_key() {
+        let store = Arc::new(MemStore::new());
+        store.set("openai", "sk-test-key").unwrap();
+        let mut app = test_app_with_store(store);
+        app.key_probe_nonce = 7;
+
+        app.handle_key_probed(
+            7,
+            "openai".to_string(),
+            Err(FetchError {
+                class: FetchFailure::Fetch,
+                message: "connection refused".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            app.status,
+            "Couldn't reach openai to check the key \u{2014} it is stored"
+        );
+        assert_ne!(
+            app.status,
+            "openai rejected the API key \u{2014} it is still stored"
+        );
+        assert_eq!(
+            app.store.get("openai").unwrap().as_deref(),
+            Some("sk-test-key")
+        );
+    }
+
+    /// A second `/key` while the first probe is in flight must win: the older result answers a
+    /// question the user has already replaced.
+    #[test]
+    fn a_stale_probe_result_is_discarded() {
+        let mut app = test_app();
+        app.key_probe_nonce = 7;
+        app.status = "sentinel".to_string();
+
+        app.handle_key_probed(6, "openai".to_string(), Ok(()));
+
+        assert_eq!(app.status, "sentinel");
+    }
+
+    /// The abort lives inside the nonce claim so no call site can bump the generation and forget to
+    /// cancel — the request carries an API key in its headers, and two probes in flight is two keys
+    /// in flight.
+    ///
+    /// Drives `next_key_probe_nonce` directly rather than `submit_key_entry`: `settle` awaits, which
+    /// would drive the run queue and poll a real probe task all the way to a live request. Claiming
+    /// a nonce spawns nothing.
+    #[tokio::test]
+    async fn claiming_a_probe_nonce_aborts_the_previous_probe() {
+        let mut app = test_app();
+        let (handle, probe) = pending_task();
+        app.key_probe = Some(handle);
+
+        let nonce = app.next_key_probe_nonce();
+
+        settle(&probe).await;
+        assert!(
+            probe.is_finished(),
+            "a replaced probe must not be left running with the previous key"
+        );
+        assert_ne!(nonce, 0);
+        assert!(
+            app.key_probe.is_none(),
+            "the aborted handle must be dropped"
+        );
+    }
+
+    /// Clearing the key is the natural next move after pasting the wrong one, and it used to
+    /// produce the exact failure #61 exists to remove: "API key cleared for openai", then fifteen
+    /// seconds later "openai accepted the API key" — a confident sentence about a key that is no
+    /// longer stored. The failure arms were worse: both end in "it is still stored".
+    #[tokio::test]
+    async fn clearing_a_key_cancels_the_in_flight_probe() {
+        let store = Arc::new(MemStore::new());
+        store.set("openai", "sk-test-key").unwrap();
+        let mut app = test_app_with_store(store);
+        let (handle, probe) = pending_task();
+        app.key_probe = Some(handle);
+        app.key_probe_nonce = 7;
+
+        app.clear_key("openai");
+
+        settle(&probe).await;
+        assert!(
+            probe.is_finished(),
+            "the request still carries the key that was just deleted"
+        );
+        assert!(app.key_probe.is_none());
+
+        // The generation moved too, so a result already on the channel is discarded rather than
+        // rendered over the sentence that is true.
+        app.handle_key_probed(7, "openai".to_string(), Ok(()));
+        assert_eq!(app.status, "API key cleared for openai");
+    }
+
+    /// Sign-out's half of the same gap, driven through `cancel_session_tasks` rather than
+    /// `sign_out`: `sign_out` calls `Session::clear`, which deletes the developer's real
+    /// `$XDG_CONFIG_HOME/light-factory/session.json`, and no test in this workspace mutates the
+    /// process environment to redirect it. `cancel_session_tasks` is the whole of what `sign_out`
+    /// does before the unbounded logout await, which is where the window is: `self.api` has no
+    /// timeout, so a server that never answers would hold a live API key in task memory and on the
+    /// wire indefinitely past the session that authorised it.
+    #[tokio::test]
+    async fn ending_the_session_cancels_the_in_flight_probe() {
+        let mut app = test_app();
+        let (probe_handle, probe) = pending_task();
+        let (fetch_handle, fetch) = pending_task();
+        app.key_probe = Some(probe_handle);
+        app.key_probe_nonce = 7;
+        app.modal.track_fetch(fetch_handle);
+        app.status = "sentinel".to_string();
+
+        app.cancel_session_tasks();
+
+        settle(&probe).await;
+        settle(&fetch).await;
+        assert!(probe.is_finished(), "the `/key` probe outlived the session");
+        assert!(fetch.is_finished(), "the model fetch outlived the session");
+
+        app.handle_key_probed(7, "openai".to_string(), Ok(()));
+        assert_eq!(
+            app.status, "sentinel",
+            "a late probe must not overwrite the sign-in screen's status"
+        );
+    }
+
+    /// The socket dropping ends the session just as definitively, and the status it sets —
+    /// `status.disconnected` — is the one a late probe would replace with news about a provider.
+    #[tokio::test]
+    async fn losing_the_socket_cancels_the_in_flight_probe() {
+        let mut app = test_app();
+        app.mode = Mode::Connected;
+        let (handle, probe) = pending_task();
+        app.key_probe = Some(handle);
+        app.key_probe_nonce = 7;
+
+        app.handle_server(ServerMessage::Error {
+            code: "ws_closed".to_string(),
+            message: "server closed the connection".to_string(),
+        });
+
+        settle(&probe).await;
+        assert!(probe.is_finished(), "the probe outlived the connection");
+        let disconnected = app.status.clone();
+        assert!(!disconnected.is_empty());
+
+        app.handle_key_probed(7, "openai".to_string(), Ok(()));
+        assert_eq!(
+            app.status, disconnected,
+            "a late probe must not overwrite the disconnected status"
+        );
     }
 
     #[test]
