@@ -180,11 +180,23 @@ async fn check_status(
 /// the body was captured; nothing about the body reaches that error, which [`read_capped`] already
 /// guarantees.
 ///
+/// **Residual, stated plainly:** [`redact_secret`] is an exact-substring match, so it is defeated
+/// by any *meaningful* character the sender inserts into the middle of an echoed key — a literal
+/// space, a hyphen, anything that is neither a control character nor [`is_invisible`]. No
+/// substring method can close that, and fuzzy matching would mangle honest text while still losing
+/// to base64 or a key split across two JSON fields. It is accepted because it requires a hostile
+/// endpoint deliberately obfuscating a credential it *already holds*, in a message shown only to
+/// that credential's own owner — no attacker gains anything. What redaction actually defends is the
+/// realistic case: an honest gateway echoing the key verbatim in a diagnostic, and the near-misses
+/// (control characters, invisible characters, our own U+FFFD, stored whitespace) that would
+/// otherwise let a verbatim echo slip through unredacted.
+///
 /// The order of the three transforms is deliberate and must not be rearranged. The invariant is
 /// that **every transform which deletes characters runs before redaction, and every transform which
 /// truncates runs after it**:
-/// 1. **normalize** first — it deletes control characters, so a key the sender split with an `ESC`
-///    or a newline is rejoined into a contiguous string that the exact-substring match can find;
+/// 1. **normalize** first — it deletes control, invisible, and replacement characters, so a key the
+///    sender split with an `ESC`, a newline, a zero-width space, or an invalid UTF-8 byte is
+///    rejoined into a contiguous string that the exact-substring match can find;
 /// 2. **redact** second, before any truncation, so a cut cannot bisect the key and leave a usable
 ///    prefix;
 /// 3. **cap** last — it truncates, so it must not run while an unredacted key is still present.
@@ -224,6 +236,41 @@ fn extract_error_message(body: &str) -> Option<String> {
     })
 }
 
+/// Characters deleted from a captured detail on top of [`char::is_control`].
+///
+/// Two independent reasons, both load-bearing:
+///
+/// * **Terminal spoofing.** `char::is_control` covers only Unicode category Cc, so the bidi
+///   overrides and zero-width format characters (Cf) sail straight through it. U+202E
+///   RIGHT-TO-LEFT OVERRIDE can visually reverse a rendered line and U+200B ZERO WIDTH SPACE can
+///   hide a word boundary — the same class of attack as the raw `ESC` this filter already refuses,
+///   and this text is entirely sender-chosen.
+/// * **Redaction evasion.** Every character here is invisible or near-invisible, so an endpoint
+///   could plant one inside an echoed API key to break [`redact_secret`]'s exact-substring match
+///   while the key still reads normally on screen. Deleting them rejoins the key *before*
+///   redaction runs, which is the ordering invariant [`error_detail`] documents.
+///
+/// U+FFFD is in the list for the second reason specifically, and it is the sharpest case: it is
+/// inserted by **our own** `from_utf8_lossy` at a byte offset the *sender* chooses, so a single
+/// invalid byte planted inside an echoed key used to split it and leak the whole credential in the
+/// clear. It carries no diagnostic value either — it says only "the endpoint sent bytes that are
+/// not UTF-8", which a garbled message already conveys.
+/// `a_key_split_by_an_invalid_utf8_byte_is_still_redacted` pins this.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'                 // SOFT HYPHEN
+        | '\u{061c}'               // ARABIC LETTER MARK
+        | '\u{180e}'               // MONGOLIAN VOWEL SEPARATOR
+        | '\u{200b}'..='\u{200f}' // zero-width space/non-joiner/joiner, LRM, RLM
+        | '\u{202a}'..='\u{202e}' // bidi embedding and override
+        | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+        | '\u{2066}'..='\u{2069}' // bidi isolates
+        | '\u{feff}'               // ZERO WIDTH NO-BREAK SPACE / BOM
+        | '\u{fffd}'               // REPLACEMENT CHARACTER — see above
+    )
+}
+
 /// Flatten to a single line: every control character deleted, then trimmed.
 ///
 /// The result is one line **by construction** — `\n` and `\r` are control characters, so they are
@@ -244,10 +291,16 @@ fn extract_error_message(body: &str) -> Option<String> {
 /// invariant [`error_detail`] documents: every transform that deletes characters must run before
 /// redaction, so a key it reassembles is still matchable.
 /// `a_key_split_by_a_newline_in_the_body_is_still_redacted` pins this.
+///
+/// **The deleted characters are not replaced with a space, and must not be.** Substituting a
+/// separator would read better — a two-line body currently renders as `...errorSecond line...`,
+/// fused at the seam — but it would reintroduce exactly the bug above: the inserted space would
+/// sit inside the rejoined key and defeat [`redact_secret`]'s exact-substring match again. The
+/// readability cost is the price of the security property, deliberately paid.
 fn normalize_detail(message: &str) -> String {
     message
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_invisible(*c))
         .collect::<String>()
         .trim()
         .to_string()
@@ -261,10 +314,23 @@ fn normalize_detail(message: &str) -> String {
 /// at every character boundary. The marker is visible rather than a silent deletion so a user who
 /// sees it knows why the message reads oddly.
 fn redact_secret(text: String, secret: Option<&str>) -> String {
-    match secret {
-        Some(s) if !s.is_empty() => text.replace(s, "<redacted>"),
-        _ => text,
+    let Some(secret) = secret else {
+        return text;
+    };
+    // The needle is normalized exactly as the haystack was. Without this, a key that is merely
+    // *stored* with surrounding whitespace never matches: `resolve_key`
+    // (`crates/tui/src/selection.rs`) filters only for emptiness and does not trim, so a key read
+    // from a file or `export KEY=$(cat key.txt)` keeps its trailing newline — while the haystack
+    // has had every control character deleted. The two could then never be equal, and an endpoint
+    // echoing the key verbatim would be rendered unredacted. Normalizing both sides is what makes
+    // the comparison meaningful rather than incidental.
+    let needle = normalize_detail(secret);
+    if needle.is_empty() {
+        // A whitespace-only key normalizes away entirely. Replacing the empty pattern would match
+        // at every character boundary and turn the whole detail into markers.
+        return text;
     }
+    text.replace(&needle, "<redacted>")
 }
 
 /// Truncate to `max` **characters** (not bytes — a byte cut can split a code point) with an
@@ -647,7 +713,13 @@ mod tests {
         let err = list_models_at("openai", &server.uri(), "bad-key", ListBounds::DEFAULT)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("401") || err.to_string().contains("status"));
+        // Exact rather than a disjunction with "status": since `check_status` names the code in
+        // its own context line, the outermost message always carries "401" and the fallback arm
+        // was dead slack that would have hidden a regression in that context string.
+        assert!(
+            err.to_string().contains("401"),
+            "the outermost message must name the status: {err:#}"
+        );
     }
 
     #[tokio::test]
@@ -1286,9 +1358,12 @@ mod tests {
             .expect_err("a 400 must be an error");
 
         let chain = format!("{err:#}");
-        assert!(
-            chain.matches('z').count() <= DETAIL_MAX_CHARS,
-            "the detail must be capped at {DETAIL_MAX_CHARS} characters: {chain}"
+        // `==`, not `<=`: `cap_chars` keeps exactly `max` characters when it truncates, so an
+        // upper bound would still pass if the cap silently tightened.
+        assert_eq!(
+            chain.matches('z').count(),
+            DETAIL_MAX_CHARS,
+            "the detail must be capped at exactly {DETAIL_MAX_CHARS} characters: {chain}"
         );
         assert!(
             chain.contains('\u{2026}'),
@@ -1330,5 +1405,163 @@ mod tests {
             !chain.contains("0123456789abcdef"),
             "not even a prefix of the key may survive: {chain}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_key_split_by_an_invalid_utf8_byte_is_still_redacted() {
+        // The sharpest evasion: the splitting character is inserted by *our own* decoder.
+        // `String::from_utf8_lossy` turns a single sender-chosen invalid byte into U+FFFD, which is
+        // not a control character — so before `is_invisible` covered it, the whole 40-character key
+        // was rendered in the clear, split only by a glyph a reader skims past.
+        const KEY: &str = "sk-test-0123456789abcdef0123456789abcdef";
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(br#"{"error":{"message":"invalid key "#);
+        body.extend_from_slice(&KEY.as_bytes()[..20]);
+        body.push(0xFF);
+        body.extend_from_slice(&KEY.as_bytes()[20..]);
+        body.extend_from_slice(br#" was rejected"}}"#);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let err = list_models_at("openai", &server.uri(), KEY, tight())
+            .await
+            .expect_err("a 401 must be an error");
+
+        let chain = format!("{err:#}");
+        assert!(
+            !chain.contains("0123456789abcdef"),
+            "an invalid byte inside the key must not defeat redaction: {chain}"
+        );
+        assert!(
+            chain.contains("<redacted>"),
+            "the key must be redacted, not merely absent: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_split_by_a_zero_width_space_is_still_redacted() {
+        // U+200B is category Cf, not Cc, so `char::is_control` returns false for it. Without
+        // `is_invisible` it would survive normalization, split the key, and render a credential
+        // that looks entirely intact on screen.
+        const KEY: &str = "sk-test-0123456789abcdef0123456789abcdef";
+        let (head, tail) = KEY.split_at(24);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": { "message": format!("invalid key {head}\u{200b}{tail} was rejected") }
+            })))
+            .mount(&server)
+            .await;
+
+        let err = list_models_at("openai", &server.uri(), KEY, tight())
+            .await
+            .expect_err("a 401 must be an error");
+
+        let chain = format!("{err:#}");
+        assert!(
+            !chain.contains("0123456789abcdef"),
+            "a zero-width space inside the key must not defeat redaction: {chain}"
+        );
+        assert!(
+            chain.contains("<redacted>"),
+            "the key must be redacted, not merely absent: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_stored_with_surrounding_spaces_is_still_redacted() {
+        // `resolve_key` (crates/tui/src/selection.rs) filters only for emptiness and never trims,
+        // so a key pasted or read from a file can carry surrounding spaces. Spaces are legal in an
+        // HTTP header value, so unlike a stray newline this reaches the wire, the endpoint echoes
+        // the *trimmed* key it actually parsed, and redaction must still fire. It only does because
+        // `redact_secret` normalizes the needle the same way the haystack was normalized.
+        const KEY: &str = "sk-test-0123456789abcdef0123456789abcdef";
+        let stored = format!("  {KEY}  ");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": { "message": format!("The API key {KEY} is not authorized") }
+            })))
+            .mount(&server)
+            .await;
+
+        let err = list_models_at("openai", &server.uri(), &stored, tight())
+            .await
+            .expect_err("a 401 must be an error");
+
+        let chain = format!("{err:#}");
+        assert!(
+            !chain.contains("0123456789abcdef"),
+            "a stored key's surrounding spaces must not defeat redaction: {chain}"
+        );
+        assert!(
+            chain.contains("<redacted>"),
+            "the key must be redacted, not merely absent: {chain}"
+        );
+    }
+
+    #[test]
+    fn redaction_normalizes_the_needle_the_same_way_as_the_haystack() {
+        // The unit-level contract behind the test above, pinned without the HTTP layer — reqwest
+        // refuses to build a header from a value containing a newline, so the control-character
+        // half of this can only be reached directly.
+        const KEY: &str = "sk-test-0123456789abcdef0123456789abcdef";
+        let rendered = normalize_detail(&format!("The API key {KEY} is not authorized"));
+        for stored in [
+            format!("{KEY}\n"),       // export KEY=$(cat key.txt)
+            format!("  {KEY}  "),     // pasted with surrounding spaces
+            format!("{KEY}\u{200b}"), // a zero-width space rode along on the paste
+        ] {
+            let out = redact_secret(rendered.clone(), Some(&stored));
+            assert!(
+                !out.contains("0123456789abcdef"),
+                "a key stored as {stored:?} must still redact, got {out:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bidi_override_characters_are_stripped_from_the_error_detail() {
+        // A RIGHT-TO-LEFT OVERRIDE can visually reorder a rendered line, which is the same class of
+        // terminal attack as a raw ESC. `char::is_control` does not catch it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": { "message": "denied\u{202e}drowssap ruoy retne\u{202c}" }
+            })))
+            .mount(&server)
+            .await;
+
+        let err = list_models_at("openai", &server.uri(), "bad-key", tight())
+            .await
+            .expect_err("a 403 must be an error");
+
+        let chain = format!("{err:#}");
+        assert!(
+            !chain.contains('\u{202e}') && !chain.contains('\u{202c}'),
+            "no bidi override may reach a rendered line: {chain:?}"
+        );
+        assert!(
+            chain.contains("denied"),
+            "the diagnostic itself must survive: {chain}"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_key_redacts_nothing_rather_than_everything() {
+        // A needle that normalizes to nothing must be skipped: `str::replace` with an empty pattern
+        // matches at every character boundary and would turn the whole detail into markers.
+        let text = "the endpoint said no".to_string();
+        assert_eq!(redact_secret(text.clone(), Some("   \n")), text);
+        assert_eq!(redact_secret(text.clone(), Some("")), text);
+        assert_eq!(redact_secret(text.clone(), None), text);
     }
 }
