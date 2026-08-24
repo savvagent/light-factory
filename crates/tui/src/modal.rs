@@ -74,10 +74,15 @@ pub(crate) enum ConnectStep {
         selected: usize,
         fetching: bool,
         error: Option<String>,
+        /// The class that produced `error`, so the step can offer the same class-specific remedy
+        /// `/models` does and decide where Esc goes. The class rather than a rendered sentence:
+        /// the remedy is looked up at render time, so `/lang` cannot leave it stale.
+        failure: Option<FetchFailure>,
         /// Whether this list was reached by typing a key rather than from an already-connected
-        /// provider. It decides where Esc goes: back to [`ConnectStep::KeyEntry`] when
-        /// `takes_key(provider) && (from_key || error.is_some())`, so a user who has just mistyped
-        /// a key lands on the field to retype it instead of on the provider list.
+        /// provider. It decides where Esc goes, together with `failure`: back to
+        /// [`ConnectStep::KeyEntry`] when `takes_key(provider) && (from_key || error.is_some())`
+        /// and the failure was not the store itself, so a user who has just mistyped a key lands
+        /// on the field to retype it instead of on the provider list.
         from_key: bool,
     },
 }
@@ -108,6 +113,7 @@ impl std::fmt::Debug for ConnectStep {
                 selected,
                 fetching,
                 error,
+                failure,
                 from_key,
             } => f
                 .debug_struct("ModelList")
@@ -117,6 +123,7 @@ impl std::fmt::Debug for ConnectStep {
                 .field("selected", selected)
                 .field("fetching", fetching)
                 .field("error", error)
+                .field("failure", failure)
                 .field("from_key", from_key)
                 .finish(),
         }
@@ -506,6 +513,7 @@ fn connect_step_next(step: &ConnectStep, key: KeyEvent) -> ModalTransition {
                         selected: 0,
                         fetching: true,
                         error: None,
+                        failure: None,
                         from_key: false,
                     }))
                 }
@@ -535,6 +543,7 @@ fn connect_step_next(step: &ConnectStep, key: KeyEvent) -> ModalTransition {
                     selected: 0,
                     fetching: true,
                     error: None,
+                    failure: None,
                     from_key: true,
                 }))
             }
@@ -561,10 +570,15 @@ fn connect_step_next(step: &ConnectStep, key: KeyEvent) -> ModalTransition {
             selected,
             fetching,
             error,
+            failure,
             from_key,
         } => match key.code {
             KeyCode::Esc => {
-                if !*fetching && takes_key(provider) && (*from_key || error.is_some()) {
+                let mistyped_key = *from_key || error.is_some();
+                // A store failure is not a mistyped key: the field would take one and then fail to
+                // write it to the same unreadable store.
+                let store_failed = *failure == Some(FetchFailure::StoreUnavailable);
+                if !*fetching && takes_key(provider) && mistyped_key && !store_failed {
                     ModalTransition::Step(Modal::Connect(ConnectStep::KeyEntry {
                         rows: rows.clone(),
                         provider: provider.clone(),
@@ -595,6 +609,7 @@ fn connect_step_next(step: &ConnectStep, key: KeyEvent) -> ModalTransition {
                     selected: cycle_index(*selected, models.len(), delta),
                     fetching: *fetching,
                     error: error.clone(),
+                    failure: *failure,
                     from_key: *from_key,
                 }))
             }
@@ -1058,12 +1073,16 @@ fn connect_view(step: &ConnectStep, ctx: &ModalContext<'_>) -> PopupView {
                 )));
             }
         }
+        // Trusted rows first: `draw_popup` sizes itself from the wrapped row count, but if a very
+        // short terminal clips anyway, what survives must be the remedy rather than the
+        // provider-supplied error that would otherwise have displaced it.
         ConnectStep::ModelList {
             provider,
             models,
             selected,
             fetching,
             error,
+            failure,
             ..
         } => {
             title = i18n::t_with(
@@ -1077,6 +1096,12 @@ fn connect_view(step: &ConnectStep, ctx: &ModalContext<'_>) -> PopupView {
                     Style::default().fg(Color::DarkGray),
                 )));
             } else if let Some(err) = error {
+                if let Some(key) = failure.and_then(FetchFailure::remedy_key) {
+                    lines.push(Line::from(Span::styled(
+                        i18n::t_with(ctx.locale, key, &[("provider", provider)]),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
                 lines.push(Line::from(Span::styled(
                     err.clone(),
                     Style::default().fg(Color::Red),
@@ -1466,6 +1491,7 @@ mod tests {
             selected: 0,
             fetching,
             error: None,
+            failure: None,
             from_key: false,
         }
     }
@@ -1720,6 +1746,7 @@ mod tests {
             selected: 0,
             fetching: false,
             error: None,
+            failure: None,
             from_key: true,
         };
         // Enter on a usable list is `Apply`, not `Close`: the modal no longer has to be
@@ -1739,6 +1766,7 @@ mod tests {
             selected: 0,
             fetching: false,
             error: Some("bad key".to_string()),
+            failure: None,
             from_key: false,
         };
         assert!(matches!(
@@ -1753,12 +1781,86 @@ mod tests {
             selected: 0,
             fetching: false,
             error: Some("unreachable".to_string()),
+            failure: None,
             from_key: false,
         };
         assert!(matches!(
             connect_step_next(&step, key(KeyCode::Esc)),
             ModalTransition::Step(Modal::Connect(ConnectStep::ProviderList { .. }))
         ));
+    }
+
+    /// Esc after a store failure must not land on the key field: the user did not mistype a key,
+    /// and writing one would fail against the same unreadable store.
+    #[test]
+    fn esc_after_a_store_failure_returns_to_the_provider_list() {
+        let step = ConnectStep::ModelList {
+            rows: vec![row("openai", RowKey::Unavailable)],
+            provider: "openai".to_string(),
+            models: Vec::new(),
+            selected: 0,
+            fetching: false,
+            error: Some("could not be read".to_string()),
+            failure: Some(FetchFailure::StoreUnavailable),
+            from_key: false,
+        };
+        let ModalTransition::Step(Modal::Connect(next)) =
+            connect_step_next(&step, key(KeyCode::Esc))
+        else {
+            panic!("Esc must step");
+        };
+        assert!(
+            matches!(next, ConnectStep::ProviderList { .. }),
+            "got {next:?}"
+        );
+    }
+
+    /// The class-specific remedy the `/models` modal offers must be reachable from `/connect` too,
+    /// and it renders above the provider-supplied error so clipping takes the foreign row first.
+    #[test]
+    fn the_connect_model_list_offers_the_remedy_above_a_store_failure() {
+        let step = ConnectStep::ModelList {
+            rows: vec![row("openai", RowKey::Unavailable)],
+            provider: "openai".to_string(),
+            models: Vec::new(),
+            selected: 0,
+            fetching: false,
+            error: Some("the credential store for openai could not be read".to_string()),
+            failure: Some(FetchFailure::StoreUnavailable),
+            from_key: false,
+        };
+        let body = body_text(&connect_view(&step, &ctx(Locale::En)));
+        let remedy = body
+            .find(
+                i18n::t(Locale::En, "models.store_remedy")
+                    .split('{')
+                    .next()
+                    .unwrap(),
+            )
+            .expect("a store failure must offer its remedy");
+        let error = body
+            .find("could not be read")
+            .expect("the error still renders");
+        assert!(
+            remedy < error,
+            "the remedy must survive clipping first: {body}"
+        );
+
+        // A transport failure has no remedy to offer, so only the error renders.
+        let step = ConnectStep::ModelList {
+            rows: vec![row("openai", RowKey::Present)],
+            provider: "openai".to_string(),
+            models: Vec::new(),
+            selected: 0,
+            fetching: false,
+            error: Some("connection refused".to_string()),
+            failure: Some(FetchFailure::Fetch),
+            from_key: false,
+        };
+        assert_eq!(
+            body_text(&connect_view(&step, &ctx(Locale::En))),
+            "connection refused"
+        );
     }
 
     #[test]
@@ -1770,6 +1872,7 @@ mod tests {
             selected: 0,
             fetching: true,
             error: None,
+            failure: None,
             from_key: false,
         };
         assert!(matches!(
@@ -2513,6 +2616,7 @@ mod tests {
             selected: 0,
             fetching: true,
             error: None,
+            failure: None,
             from_key: false,
         }));
         let awaiting = host.nonce();
@@ -2534,6 +2638,7 @@ mod tests {
             selected: 0,
             fetching: true,
             error: None,
+            failure: None,
             from_key: false,
         }));
         assert!(
@@ -2587,6 +2692,7 @@ mod tests {
             selected: 1,
             fetching: false,
             error: None,
+            failure: None,
             from_key: false,
         };
         assert_eq!(

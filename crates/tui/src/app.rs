@@ -57,7 +57,7 @@ pub enum UiEvent {
     ConnectModels {
         nonce: u64,
         provider: String,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<String>, FetchError>,
     },
     ModelsFetched {
         nonce: u64,
@@ -714,12 +714,10 @@ impl App {
         let task = tokio::spawn(async move {
             let result = fetch_model_list(&provider, key, store.as_ref(), lang).await;
             let event = match sink {
-                // The connect modal renders only the message; #47's classification is consumed by
-                // the `/models` modal alone.
                 FetchSink::Connect => UiEvent::ConnectModels {
                     nonce,
                     provider,
-                    result: result.map_err(|e| e.message),
+                    result,
                 },
                 FetchSink::Models => UiEvent::ModelsFetched {
                     nonce,
@@ -736,7 +734,7 @@ impl App {
         &mut self,
         nonce: u64,
         provider: String,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<String>, FetchError>,
     ) {
         if nonce != self.modal.nonce() {
             return;
@@ -756,28 +754,32 @@ impl App {
         if !matches {
             return;
         }
-        let err_msg = result
-            .as_ref()
-            .err()
-            .map(|e| self.t_with("connect.fetch_error", &[("error", e)]));
+        // Classified before the mutable borrow: `fetch_error_message` reads `self`, and it is what
+        // keeps a sentence that already names the provider and the cause from being wrapped again.
+        let outcome = match result {
+            Ok(list) => Ok(list),
+            Err(e) => Err((self.fetch_error_message(&provider, &e), e.class)),
+        };
         if let Some(Modal::Connect(ConnectStep::ModelList {
             models,
             selected,
             fetching,
             error,
+            failure,
             ..
         })) = self.modal.current_mut()
         {
-            match result {
+            *fetching = false;
+            match outcome {
                 Ok(list) => {
                     *models = list;
                     *selected = 0;
-                    *fetching = false;
                     *error = None;
+                    *failure = None;
                 }
-                Err(_) => {
-                    *fetching = false;
-                    *error = err_msg;
+                Err((message, class)) => {
+                    *error = Some(message);
+                    *failure = Some(class);
                 }
             }
         }
@@ -2208,6 +2210,7 @@ mod tests {
             selected: 0,
             fetching,
             error: None,
+            failure: None,
             from_key: false,
         }
     }
@@ -2326,6 +2329,59 @@ mod tests {
         ));
     }
 
+    /// The `/connect` sink must not re-wrap a sentence that already names the provider and the
+    /// cause: "Couldn't fetch models: the credential store for openai could not be read: ...".
+    #[test]
+    fn connect_does_not_double_wrap_a_store_failure() {
+        let mut app = test_app();
+        let nonce = open(
+            &mut app,
+            Modal::Connect(connect_model_list_step(vec![], true)),
+        );
+        app.handle_connect_models(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(
+                FetchFailure::StoreUnavailable,
+                "store for openai could not be read",
+            )),
+        );
+        let Some(ConnectStep::ModelList { error, failure, .. }) = connect_step(&app) else {
+            panic!("expected the model list, got {:?}", connect_step(&app));
+        };
+        let error = error.as_deref().expect("a failed fetch sets an error");
+        assert!(
+            !error.contains("Couldn't fetch models"),
+            "double-wrapped: {error}"
+        );
+        assert_eq!(*failure, Some(FetchFailure::StoreUnavailable));
+    }
+
+    /// A transport failure keeps the wrapper it has always had, and its class offers no remedy.
+    #[test]
+    fn connect_still_wraps_a_transport_error() {
+        let mut app = test_app();
+        let nonce = open(
+            &mut app,
+            Modal::Connect(connect_model_list_step(vec![], true)),
+        );
+        app.handle_connect_models(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(FetchFailure::Fetch, "connection refused")),
+        );
+        let Some(ConnectStep::ModelList { error, failure, .. }) = connect_step(&app) else {
+            panic!("expected the model list");
+        };
+        let error = error.as_deref().expect("a failed fetch sets an error");
+        assert!(
+            error.contains("Couldn't fetch models"),
+            "not wrapped: {error}"
+        );
+        assert!(error.contains("connection refused"));
+        assert_eq!(*failure, Some(FetchFailure::Fetch));
+    }
+
     #[test]
     fn handle_connect_models_surfaces_a_fetch_error() {
         let mut app = test_app();
@@ -2333,7 +2389,11 @@ mod tests {
             &mut app,
             Modal::Connect(connect_model_list_step(vec![], true)),
         );
-        app.handle_connect_models(nonce, "openai".to_string(), Err("bad key".to_string()));
+        app.handle_connect_models(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(FetchFailure::Fetch, "bad key")),
+        );
         assert!(matches!(
             connect_step(&app),
             Some(ConnectStep::ModelList {
@@ -2860,6 +2920,7 @@ mod tests {
                 selected: 0,
                 fetching: true,
                 error: None,
+                failure: None,
                 from_key: false,
             }),
         );
@@ -2908,6 +2969,7 @@ mod tests {
                 selected: 0,
                 fetching: true,
                 error: None,
+                failure: None,
                 from_key: false,
             }),
         );
@@ -3066,6 +3128,7 @@ mod tests {
                 selected: 1,
                 fetching: false,
                 error: None,
+                failure: None,
                 from_key: false,
             }),
         );
@@ -3136,6 +3199,7 @@ mod tests {
                 selected: 0,
                 fetching: true,
                 error: None,
+                failure: None,
                 from_key: true,
             }),
         );
