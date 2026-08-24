@@ -616,14 +616,60 @@ impl App {
         }
         // The nonce matched, so this is the current probe's own result and that task is done.
         self.key_probe = None;
-        let status = match &result {
-            Ok(()) => "status.key_verified",
-            // The one predicate #55 draws: a credential failure, versus anything that says nothing
-            // about the key.
-            Err(e) if e.class.needs_credentials() => "status.key_rejected",
-            Err(_) => "status.key_unreachable",
+        let Err(e) = &result else {
+            let source = crate::selection::key_status(&provider, self.store.as_ref());
+            self.status = self.key_verified_status(&provider, source);
+            return;
+        };
+        // An exhaustive match rather than `FetchFailure::needs_credentials`, which is the *modal's*
+        // question ("is there a credential-shaped remedy?") and not this one ("what did we learn
+        // about the key the user just typed?"). The two answers already diverge: `MissingKey`
+        // needs credentials but is not a rejection, and a class added to that predicate later
+        // would silently inherit the accusation. Matching every variant here makes a new class a
+        // compile error at the place that has to word it.
+        let status = match e.class {
+            // The provider answered, and refused the credential we sent it.
+            FetchFailure::Auth => "status.key_rejected",
+            // No key reached the request at all, so nothing was tested. `/key` always probes with
+            // `Some(key)`, so this is unreachable today — which is exactly why it must not quietly
+            // borrow the rejection wording if that ever changes.
+            FetchFailure::MissingKey => "status.key_unresolved",
+            // DNS, TLS, a timeout, a 5xx, a panic: says nothing about the key.
+            FetchFailure::Fetch => "status.key_unreachable",
         };
         self.status = self.t_with(status, &[("provider", &provider)]);
+    }
+
+    /// The sentence for a probe the provider accepted, given where the key that requests will
+    /// *actually* use comes from.
+    ///
+    /// The probe deliberately sends the key the user just typed, so "accepted" is a true statement
+    /// about that string and a misleading one about the process: [`crate::selection::resolve_key`]
+    /// prefers an exported `OPENAI_API_KEY` over the keyring for all real traffic, so a developer
+    /// with one set would read a green confirmation and then bill a different account on every
+    /// request. The failure has no error to surface — the shadowing key works — so the status is
+    /// the only place it can be said.
+    ///
+    /// Takes `source` rather than reading it, so both arms are testable without the ambient
+    /// environment deciding which one runs.
+    ///
+    /// The match is exhaustive on purpose: a new [`crate::selection::KeyStatus`] variant is a
+    /// decision about whether "accepted" is still the honest word, and should stop the build here
+    /// rather than fall through to the stronger claim.
+    fn key_verified_status(&self, provider: &str, source: crate::selection::KeyStatus) -> String {
+        let shadowing = match source {
+            // `Env` is returned only when that variable holds a non-empty value, so the name is
+            // always available; the `Option` is `env_key_var`'s, not a doubt about this arm.
+            crate::selection::KeyStatus::Env => light_factory_providers::env_key_var(provider),
+            crate::selection::KeyStatus::Keyring | crate::selection::KeyStatus::None => None,
+        };
+        match shadowing {
+            Some(var) => self.t_with(
+                "status.key_verified_shadowed",
+                &[("provider", provider), ("var", var)],
+            ),
+            None => self.t_with("status.key_verified", &[("provider", provider)]),
+        }
     }
 
     /// Tear down any open modal, and cancel and invalidate its in-flight fetch.
@@ -2198,6 +2244,21 @@ mod tests {
             Ok(())
         }
     }
+
+    /// A provider id whose verification probe cannot reach a socket, for the tests that let
+    /// `submit_key_entry` spawn one.
+    ///
+    /// No test may reach the network, and the `/key` tests hold to that by never awaiting after
+    /// the spawn — nothing drives the current-thread runtime's queue, so the probe is dropped
+    /// unpolled. That is a property of how the tests are written, enforced by nothing. This makes
+    /// it a property of the task instead: `local` is not `ollama`, so `fetch_model_list` reaches
+    /// `list_models`, which resolves a base URL first and bails on an unknown provider before any
+    /// request is built. `env_key_var("local")` is also `None`, so nothing here depends on the
+    /// ambient environment either.
+    ///
+    /// `submit_key_entry` never consults `takes_key` — that guard lives in `enter_key_entry` — so
+    /// the path under test is the same one `/key openai` takes.
+    const PROBE_SAFE_PROVIDER: &str = "local";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -3801,6 +3862,10 @@ mod tests {
     /// between the spawn and the end of the test, so the probe is dropped unpolled and no request
     /// is issued.
     ///
+    /// That property is a convention, though, and one `.await` added here later would quietly
+    /// break it — so [`PROBE_SAFE_PROVIDER`] makes it structural as well: the spawned task cannot
+    /// open a socket whatever polls it.
+    ///
     /// Env-independent, but not because the path avoids the environment — `rebuild_provider` reads
     /// `OPENAI_API_KEY` and friends through `selection_from_env`. It is independent because that
     /// read reaches only `provider`/`provider_info`, and neither assertion here touches them. A
@@ -3808,17 +3873,17 @@ mod tests {
     #[tokio::test]
     async fn submitting_a_key_reports_it_as_stored_but_unverified() {
         let mut app = test_app();
-        app.key_target = Some("openai".to_string());
+        app.key_target = Some(PROBE_SAFE_PROVIDER.to_string());
         app.key_input = "sk-test-key".to_string();
 
         app.submit_key_entry();
 
         assert_eq!(
             app.status,
-            "API key stored for openai \u{2014} not yet verified"
+            "API key stored for local \u{2014} not yet verified"
         );
         assert_eq!(
-            app.store.get("openai").unwrap().as_deref(),
+            app.store.get(PROBE_SAFE_PROVIDER).unwrap().as_deref(),
             Some("sk-test-key"),
             "the key must still be written to the store"
         );
@@ -3827,7 +3892,7 @@ mod tests {
     #[tokio::test]
     async fn submitting_a_key_starts_a_probe() {
         let mut app = test_app();
-        app.key_target = Some("openai".to_string());
+        app.key_target = Some(PROBE_SAFE_PROVIDER.to_string());
         app.key_input = "sk-test-key".to_string();
 
         app.submit_key_entry();
@@ -3854,15 +3919,56 @@ mod tests {
         assert_eq!(app.key_probe_nonce, 0);
     }
 
+    /// The wiring from a successful probe to the accepted status.
+    ///
+    /// Runs against [`PROBE_SAFE_PROVIDER`] so the assertion holds under both suite variants: this
+    /// arm now consults `key_status`, and for a provider with a declared env var the answer — and
+    /// therefore the sentence — depends on whether the developer (or CI) has that variable
+    /// exported. `local` declares none, so `key_status` can never return `Env` for it. The two
+    /// sentences themselves are covered directly below, without the environment in the loop.
     #[test]
     fn an_accepted_key_reports_verification() {
         let mut app = test_app();
         app.key_probe_nonce = 7;
 
-        app.handle_key_probed(7, "openai".to_string(), Ok(()));
+        app.handle_key_probed(7, PROBE_SAFE_PROVIDER.to_string(), Ok(()));
 
-        assert_eq!(app.status, "openai accepted the API key");
+        assert_eq!(app.status, "local accepted the API key");
         assert!(app.key_probe.is_none());
+    }
+
+    /// "Accepted" is a claim about the provider; the old "saved" was a claim about a keyring. When
+    /// an exported variable shadows the keyring, the stronger claim is true of a string that no
+    /// later request will send — `resolve_key` prefers the environment — so a valid key for a
+    /// different account bills the wrong org behind a green confirmation. The status must name the
+    /// variable that actually wins (#61 review, and the reason #60 exists).
+    #[test]
+    fn an_accepted_key_names_the_variable_that_shadows_it() {
+        let app = test_app();
+
+        let status = app.key_verified_status("openai", crate::selection::KeyStatus::Env);
+
+        assert_eq!(
+            status,
+            "openai accepted the key \u{2014} but OPENAI_API_KEY is used"
+        );
+    }
+
+    /// The other side of the same call: with nothing shadowing it, the key just stored is the key
+    /// that will be used, and the plain confirmation is exactly true.
+    #[test]
+    fn an_accepted_key_with_nothing_shadowing_it_reports_plain_verification() {
+        let app = test_app();
+
+        for source in [
+            crate::selection::KeyStatus::Keyring,
+            crate::selection::KeyStatus::None,
+        ] {
+            assert_eq!(
+                app.key_verified_status("openai", source),
+                "openai accepted the API key"
+            );
+        }
     }
 
     /// A rejected key is still the key the user asked us to hold: a 401 can come from an auth-edge
@@ -3895,10 +4001,13 @@ mod tests {
         );
     }
 
-    /// Pins the shared arm: both credential classes route through `needs_credentials()`, so a probe
-    /// that reports `MissingKey` cannot silently fall through to the retryable wording.
+    /// `MissingKey` means no key reached the request at all — the provider was never asked, so it
+    /// refused nothing. Routing it through `FetchFailure::needs_credentials` said "rejected",
+    /// which is a different and untrue sentence; the same predicate is being widened to cover a
+    /// keyring that could not be read, which would make `/key` announce a rejection for a store
+    /// failure. `/key` words its own outcomes instead (#61 review).
     #[test]
-    fn a_missing_key_class_reports_rejection() {
+    fn a_missing_key_class_is_not_reported_as_a_rejection() {
         let mut app = test_app();
         app.key_probe_nonce = 7;
 
@@ -3913,7 +4022,11 @@ mod tests {
 
         assert_eq!(
             app.status,
-            "openai rejected the API key \u{2014} it is still stored"
+            "No API key resolved for openai \u{2014} nothing was checked"
+        );
+        assert!(
+            !app.status.contains("rejected"),
+            "nothing was sent, so nothing was refused"
         );
     }
 
@@ -3937,7 +4050,7 @@ mod tests {
 
         assert_eq!(
             app.status,
-            "Couldn't reach openai to verify the API key \u{2014} it is stored"
+            "Couldn't reach openai to check the key \u{2014} it is stored"
         );
         assert_ne!(
             app.status,
