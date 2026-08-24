@@ -418,6 +418,11 @@ path has no body cap and no deadline" — and error-body capture there depends o
 `read_capped`-equivalent that #62 must introduce, so it belongs in that issue rather than in a new
 one. **Action:** add a note to #62 rather than filing a duplicate.
 
+**R6. `crates/tui`'s `summarize_provider_error` filters only `char::is_control`.** It therefore lets
+bidi overrides and zero-width characters through to a rendered line — the same gap §11 D4 closes on
+this side. Out of scope: `crates/tui` is off-limits while PR #68 is in flight. **Follow-up to file:**
+"tui: strip Unicode format characters, not just controls, in summarize_provider_error".
+
 **R3. `reqwest::Error`'s Display includes the request URL, unredacted.** If a provider ever moved
 its key into a query parameter, the key would appear in the error via the source chain — with or
 without this change. All four keyed providers on this path send the key in a header
@@ -479,3 +484,57 @@ order. The code comment now says so. Object-first is a readability choice, not a
 returns `Err` only for a 4xx/5xx, and that error always carries its status, so `status` is always
 `Some`. The arms are kept as the type's shape rather than removed — they cost nothing and avoid a
 panic if reqwest ever widens that constructor — and a comment now says they are not a live path.
+
+**D4. Normalization also deletes invisible and replacement characters, and the redaction needle is
+normalized too.** A second review round found D1's fix incomplete: it closed the newline case but
+not the general class. Two further leaks, both reproduced against the real code:
+
+1. **An invalid UTF-8 byte planted inside the echoed key.** `String::from_utf8_lossy` — *our own*
+   decoder — turns it into U+FFFD, which is not a control character, so `normalize_detail` left it
+   in place, the key stayed split, and the **entire 40-character key** rendered in the clear:
+   `invalid key sk-test-0123456789ab<U+FFFD>cdef0123456789abcdef was rejected`. Worse than D1: the
+   whole credential survives, separated by a glyph a reader skims past. The byte offset is
+   sender-chosen but the inserted *character* is introduced by us, which is what makes deleting it
+   principled rather than arbitrary.
+2. **A key stored with surrounding whitespace.** `resolve_key` (`crates/tui/src/selection.rs:82-88`)
+   filters only for emptiness and never trims, so a pasted key can carry spaces. The haystack was
+   normalized but the needle was not, so the two could never be equal and a *verbatim* echo went
+   unredacted — no obfuscation required at all.
+
+**Fix:** `normalize_detail` additionally deletes Unicode format/invisible characters (`is_invisible`:
+soft hyphen, zero-width space/joiners, LRM/RLM, bidi embeddings, overrides and isolates, word
+joiner, BOM) and U+FFFD; and `redact_secret` normalizes the needle with the same function before
+matching, skipping a needle that normalizes to nothing. The bidi half also closes a terminal-spoofing
+gap noted independently: U+202E RIGHT-TO-LEFT OVERRIDE is category Cf, so `char::is_control` never
+caught it, yet it can visually reorder a rendered line — the same class of attack as the raw `ESC`
+this filter already refused.
+
+**Residual, stated plainly and recorded in the code.** Exact-substring redaction is defeated by any
+*meaningful* character inserted into the middle of an echoed key — a literal space, a hyphen,
+anything neither control nor invisible. **No substring method can close this**, and fuzzy matching
+would mangle honest text while still losing to base64 or a key split across two JSON fields. It is
+accepted because it requires a hostile endpoint deliberately obfuscating a credential it *already
+holds*, in a message shown only to that credential's own owner — there is no attacker gain. What
+redaction defends is the realistic case: an honest gateway echoing the key verbatim, plus every
+near-miss that would let such an echo slip through unredacted.
+
+**Why not the reviewer's suggested fix.** The review proposed matching `secret.as_bytes()` against
+the raw buffer before `from_utf8_lossy`. That does not work for its own repro: the inserted byte
+splits the key in the *raw bytes* too, so a byte-level substring search misses it identically.
+Deleting the characters that carry no diagnostic value, before redaction, is what actually restores
+contiguity.
+
+Pinned by `a_key_split_by_an_invalid_utf8_byte_is_still_redacted`,
+`a_key_split_by_a_zero_width_space_is_still_redacted`,
+`a_key_stored_with_surrounding_spaces_is_still_redacted`,
+`redaction_normalizes_the_needle_the_same_way_as_the_haystack`,
+`a_whitespace_only_key_redacts_nothing_rather_than_everything`, and
+`bidi_override_characters_are_stripped_from_the_error_detail`. Each was mutation-checked: reverting
+`is_invisible`, the needle normalization, or the empty-needle guard fails a test.
+
+**D5. A note on test honesty.** A first attempt at the stored-whitespace test used a trailing
+*newline* and passed vacuously — reqwest refuses to build a header value containing a newline, so
+the request never reached the server and redaction was never exercised at all. It was replaced with
+a trailing-*space* case (spaces are legal in a header value, so it reaches the wire) plus a direct
+unit test for the control-character half. Both fail under mutation; the original did not. Recorded
+because a green test that proves nothing is the failure mode this spec's §7 is meant to prevent.
