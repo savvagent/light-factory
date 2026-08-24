@@ -394,12 +394,15 @@ A user whose Gemini key is rejected sees the provider's own sentence instead of 
 `FetchFailure::Fetch`, so the `/models` modal still offers a retry and a manual box rather than the
 credentials step. What changes is that the modal now *says* "API key not valid. Please pass a valid
 API key.", so the path is no longer silent — which is the outcome the issue calls the real fix.
-Closing it fully needs the `crates/tui` half (A1). **Follow-up to file:** "tui: reclassify a 400
-whose error body matches an auth signature as `FetchFailure::Auth`".
+Closing it fully needs the `crates/tui` half (A1). **Follow-up filed:**
+[#71](https://github.com/savvagent/light-factory/issues/71) — "tui: reclassify a 400 whose error
+body matches an auth signature as `FetchFailure::Auth`".
 
 **Issue hygiene, load-bearing:** because the issue's title AC ("...classifies as auth") is *not* met,
 the PR must reference #59 **without** a closing keyword, and the follow-up must be filed before
-merge. Otherwise the recorded gap evaporates with the issue.
+merge. Otherwise the recorded gap evaporates with the issue. Done: PR
+[#70](https://github.com/savvagent/light-factory/pull/70) says "Refs #59", and #71 carries the
+remaining half.
 
 **Verification gap:** criterion 1 pins the untruncated `{:#}` rendering inside `crates/providers`.
 What a user actually sees is that string after `crates/tui`'s 120-character
@@ -416,12 +419,14 @@ with a different rendering boundary, and widening the diff would collide with co
 completion path already has an open issue for its missing bounds — #62, "providers: the completion
 path has no body cap and no deadline" — and error-body capture there depends on the same
 `read_capped`-equivalent that #62 must introduce, so it belongs in that issue rather than in a new
-one. **Action:** add a note to #62 rather than filing a duplicate.
+one. **Action taken:** noted on
+[#62](https://github.com/savvagent/light-factory/issues/62#issuecomment-5402409661) rather than
+filing a duplicate.
 
 **R6. `crates/tui`'s `summarize_provider_error` filters only `char::is_control`.** It therefore lets
 bidi overrides and zero-width characters through to a rendered line — the same gap §11 D4 closes on
-this side. Out of scope: `crates/tui` is off-limits while PR #68 is in flight. **Follow-up to file:**
-"tui: strip Unicode format characters, not just controls, in summarize_provider_error".
+this side. Out of scope: `crates/tui` is off-limits while PR #68 is in flight. **Follow-up filed:**
+[#72](https://github.com/savvagent/light-factory/issues/72).
 
 **R3. `reqwest::Error`'s Display includes the request URL, unredacted.** If a provider ever moved
 its key into a query parameter, the key would appear in the error via the source chain — with or
