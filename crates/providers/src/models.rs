@@ -158,6 +158,9 @@ async fn check_status(
     let Some(status_err) = raw.error_for_status_ref().err() else {
         return Ok(raw);
     };
+    // Always `Some` in practice: `error_for_status_ref` returns `Err` only for a 4xx/5xx, and that
+    // error always carries its status. The `None` arms below are the type's shape, not a reachable
+    // path — they exist so this cannot panic if reqwest ever widens what that constructor returns.
     let status = status_err.status().map(|s| s.as_u16());
     let detail = error_detail(raw, bounds, secret).await;
     Err(
@@ -177,11 +180,18 @@ async fn check_status(
 /// the body was captured; nothing about the body reaches that error, which [`read_capped`] already
 /// guarantees.
 ///
-/// The order of the three transforms is deliberate and must not be rearranged:
-/// 1. **normalize** first, so a key with interleaved control characters cannot evade the match;
+/// The order of the three transforms is deliberate and must not be rearranged. The invariant is
+/// that **every transform which deletes characters runs before redaction, and every transform which
+/// truncates runs after it**:
+/// 1. **normalize** first — it deletes control characters, so a key the sender split with an `ESC`
+///    or a newline is rejoined into a contiguous string that the exact-substring match can find;
 /// 2. **redact** second, before any truncation, so a cut cannot bisect the key and leave a usable
 ///    prefix;
-/// 3. **cap** last.
+/// 3. **cap** last — it truncates, so it must not run while an unredacted key is still present.
+///
+/// Both halves of that invariant have a regression test: `a_key_split_by_a_newline_in_the_body_is
+/// _still_redacted` for the first, and the padding in `an_error_body_echoing_the_api_key_is
+/// _redacted` for the second.
 async fn error_detail(
     resp: reqwest::Response,
     bounds: ListBounds,
@@ -214,17 +224,28 @@ fn extract_error_message(body: &str) -> Option<String> {
     })
 }
 
-/// First line, control characters removed, trimmed.
+/// Flatten to a single line: every control character deleted, then trimmed.
 ///
-/// Later lines go because a multi-line error pushes the modal's own trusted rows — the remedy, and
-/// on the manual step the input box — past the bottom of the screen, which turns a model picker
-/// into a credential-phishing surface. Control characters go because a raw `ESC` written into a
-/// terminal cell is an escape-sequence injection, and this text is entirely sender-chosen.
+/// The result is one line **by construction** — `\n` and `\r` are control characters, so they are
+/// deleted along with the rest. That is what protects the layout: a multi-line error would push the
+/// modal's own trusted rows — the remedy, and on the manual step the input box — past the bottom of
+/// the screen, turning a model picker into a credential-phishing surface. Control characters go for
+/// the separate reason that a raw `ESC` written into a terminal cell is an escape-sequence
+/// injection, and this text is entirely sender-chosen.
+///
+/// **Deleting the newline rather than cutting at it is load-bearing for redaction, not a style
+/// choice.** This used to be `.lines().next()`, which is a *structural* split that the
+/// control-character filter never saw. A body echoing the key with a newline planted inside it —
+/// `"invalid key sk-test-0123456789abcdef01234567\n89abcdef was rejected"` — was cut at that
+/// newline, and the surviving 32-character fragment no longer matched the key, so
+/// [`redact_secret`]'s exact-substring replace found nothing and the fragment was rendered in the
+/// clear. The split point is sender-chosen, so the leaked prefix could be nearly the whole key.
+/// Deleting the newline instead rejoins the two halves *before* redaction runs, which is the
+/// invariant [`error_detail`] documents: every transform that deletes characters must run before
+/// redaction, so a key it reassembles is still matchable.
+/// `a_key_split_by_a_newline_in_the_body_is_still_redacted` pins this.
 fn normalize_detail(message: &str) -> String {
     message
-        .lines()
-        .next()
-        .unwrap_or_default()
         .chars()
         .filter(|c| !c.is_control())
         .collect::<String>()
@@ -484,8 +505,10 @@ struct ErrorEnvelope {
     error: ErrorPayload,
 }
 
-/// Untagged, and the variant order is load-bearing: serde tries variants top to bottom, so the
-/// object shape must precede the bare-string shape or `{"message":"..."}` would never match.
+/// Untagged. The two variants have disjoint JSON shapes — `Detailed` matches only an object,
+/// `Text` only a string — so serde resolves them unambiguously and the declaration order does not
+/// affect behaviour. Declared object-first because that is the common-case envelope, not because
+/// anything depends on the order.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ErrorPayload {
@@ -1071,16 +1094,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_non_json_error_body_falls_back_to_its_first_line() {
-        // Gateways and proxies answer with HTML or text/plain, and the first line is often the only
-        // signal there is. Later lines are dropped: a multi-line error pushes the modal's own
-        // trusted rows off the screen.
-        //
-        // The second-line marker must not overlap `reqwest::Error`'s own status Display, which is
-        // kept as the anyhow *source* and reads `HTTP status server error (502 Bad Gateway) for url
-        // (...)`. Asserting `!chain.contains("Bad Gateway")` would fail unconditionally — not
-        // because the first-line rule broke, but because the status phrase is supposed to be there.
-        const SECOND_LINE: &str = "SECOND-LINE-MUST-NOT-SURVIVE";
+    async fn a_non_json_error_body_is_flattened_to_one_bounded_line() {
+        // Gateways and proxies answer with HTML or text/plain rather than an envelope, so the raw
+        // text is the only signal there is. It is flattened rather than cut at the first line:
+        // deleting the newline is what lets `redact_secret` still match a key the sender split
+        // across one (see `a_key_split_by_a_newline_in_the_body_is_still_redacted`). The layout
+        // guarantee is unchanged — the result is a single line either way — and the length is bound
+        // by `DETAIL_MAX_CHARS` rather than by where the sender happened to put a newline.
+        const SECOND_LINE: &str = "SECOND-LINE-IS-JOINED-ON";
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -1098,11 +1119,15 @@ mod tests {
         let chain = format!("{err:#}");
         assert!(
             chain.contains("upstream connect error"),
-            "the first line of a non-JSON body must survive: {chain}"
+            "a non-JSON body's text must survive: {chain}"
         );
         assert!(
-            !chain.contains(SECOND_LINE),
-            "only the first line may survive: {chain}"
+            chain.contains(SECOND_LINE),
+            "later lines are joined on, not dropped — the newline is deleted: {chain}"
+        );
+        assert!(
+            !chain.chars().any(char::is_control),
+            "the detail must still be a single control-free line: {chain:?}"
         );
     }
 
@@ -1213,9 +1238,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_characters_and_extra_lines_are_stripped_from_the_error_detail() {
+    async fn control_characters_are_stripped_from_the_error_detail() {
         // A raw ESC written into a terminal cell is an escape-sequence injection; the body is
-        // remote-controlled, so it can carry one.
+        // remote-controlled, so it can carry one. Newlines go the same way, which is what keeps the
+        // detail to one line without a structural cut that redaction cannot see through.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -1239,8 +1265,8 @@ mod tests {
             "no control character may reach a rendered line: {chain:?}"
         );
         assert!(
-            !chain.contains("second line"),
-            "only the first line may survive: {chain}"
+            chain.contains("second line"),
+            "the newline is deleted rather than cut at, so the tail joins on: {chain}"
         );
     }
 
@@ -1267,6 +1293,42 @@ mod tests {
         assert!(
             chain.contains('\u{2026}'),
             "a truncated detail must say so: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_split_by_a_newline_in_the_body_is_still_redacted() {
+        // The exact-substring redaction can only match a key that is contiguous in the text it runs
+        // against. Every transform that *deletes* characters can therefore reassemble a split key
+        // and must run before redaction — a newline included, which is why the detail is flattened
+        // rather than cut at the first line.
+        //
+        // Without the flattening this leaks: `.lines().next()` cuts the key at the newline, the
+        // surviving fragment no longer matches the key, and redaction silently does nothing. The
+        // split point is attacker-chosen, so the leaked fragment can be nearly the whole key.
+        const KEY: &str = "sk-test-0123456789abcdef0123456789abcdef";
+        let (head, tail) = KEY.split_at(32);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": { "message": format!("invalid key {head}\n{tail} was rejected") }
+            })))
+            .mount(&server)
+            .await;
+
+        let err = list_models_at("openai", &server.uri(), KEY, tight())
+            .await
+            .expect_err("a 401 must be an error");
+
+        let chain = format!("{err:#}");
+        assert!(
+            !chain.contains(head),
+            "a newline inside the key must not let a 32-character prefix escape redaction: {chain}"
+        );
+        assert!(
+            !chain.contains("0123456789abcdef"),
+            "not even a prefix of the key may survive: {chain}"
         );
     }
 }
