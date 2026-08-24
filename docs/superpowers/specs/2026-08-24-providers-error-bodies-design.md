@@ -255,9 +255,11 @@ async fn error_detail(
   context. No part of the body reaches that error, which `read_capped`'s own doc already guarantees.
 - `from_utf8_lossy` rather than `from_utf8().ok()?`: a body with one invalid byte should not throw
   away an otherwise-readable diagnostic, and U+FFFD is not a control character.
-- **Order is deliberate:** strip control characters first (so an interleaved-control-character key
-  is matched), redact second, cap last (so truncation cannot bisect a key and leave a usable
-  prefix).
+- **Order is deliberate.** The invariant is: *every transform that deletes characters runs before
+  redaction, and every transform that truncates runs after it.* `normalize_detail` deletes (control
+  characters, **newlines included**), so it runs first and rejoins a key the sender split;
+  `cap_chars` truncates, so it runs last, when no unredacted key can still be present. See §11 D1 —
+  the first-line-cut this section originally specified leaked a key prefix.
 - `DETAIL_MAX_CHARS = 200`, above the TUI's 120-char display cap by design (A2). **Contract:** at
   most `DETAIL_MAX_CHARS` characters *of provider text*, plus a single U+2026 marker when
   truncation happened — so the rendered detail is at most 201 characters and a truncated message
@@ -308,7 +310,7 @@ site adjacent to the only thing that knows what the secret is.
 | 4xx/5xx with a non-JSON body | First sanitized line of the raw text, capped (A4). |
 | 4xx/5xx with a body over `max_error_bytes` | `read_capped` refuses → `None` → status-only context. Today's behaviour exactly. |
 | 4xx/5xx with a body echoing the API key | Key replaced with `<redacted>` before the cap (A5). |
-| 4xx/5xx with a body containing `ESC`/`CR`/`NUL` | Control characters stripped; only the first line survives. |
+| 4xx/5xx with a body containing `ESC`/`CR`/`NUL`/`LF` | Every control character deleted, so the detail is one line by construction (§11 D1). |
 | 4xx/5xx with invalid UTF-8 | Lossy-decoded; U+FFFD survives sanitization. |
 | Body read stalls after the status line | The per-request `timeout` from `model_list_request` covers the whole request including the body read, so the deadline still binds. |
 | Ollama non-2xx | Same handling, `secret: None`. Still classified `Fetch` by the TUI (`class_for_provider`), unchanged. |
@@ -338,8 +340,10 @@ All offline, against `wiremock`, next to the code in `crates/providers/src/model
    `max_error_bytes`; no body content in `format!("{err:#}")`, and the status still present.
 8. `an_error_body_echoing_the_api_key_is_redacted` — the key appears in the body; `format!("{err:#}")`
    must not contain it. Uses a key long enough that an accidental prefix leak would be visible.
-9. `control_characters_and_extra_lines_are_stripped_from_the_error_detail` — a body whose message
-   contains `\n`, `\r` and `\u{1b}`; only the first line survives and no control character does.
+9. `control_characters_are_stripped_from_the_error_detail` — a body whose message contains `\n` and
+   `\u{1b}`; no control character survives and the tail is joined on rather than cut off (§11 D1).
+9b. `a_key_split_by_a_newline_in_the_body_is_still_redacted` — the §11 D1 regression: a body echoing
+   the key with a newline planted inside it. Neither the key nor a 32-character prefix may appear.
 10. `an_over_long_error_detail_is_capped` — a 1 KiB single-line message; the rendered detail is
     capped at `DETAIL_MAX_CHARS` and ends in an ellipsis marker.
 11. `default_bounds_are_the_production_values` — extended with `max_error_bytes == 16 * 1024`.
@@ -432,3 +436,46 @@ already existed via `summarize_provider_error` for non-status errors; what is ne
 attributes the text to the remote party rather than to this tool, the one-line + control-free +
 200-char normalization prevents layout takeover and escape-sequence injection, and the TUI applies
 its own 120-char cap on top. Accepted, and it is the deliberate trade the issue asks for.
+
+## 11. Deviations from the reviewed design
+
+**D1. `normalize_detail` flattens the message instead of cutting at the first line.** §5.3 originally
+specified "first line, control-free, trimmed", implemented as `.lines().next()` followed by a
+control-character filter. Code review found this leaks a sender-chosen prefix of the API key, and a
+test reproduced it:
+
+```
+body:   {"error":{"message":"invalid key sk-test-0123456789abcdef01234567\n89abcdef was rejected"}}
+render: the provider returned HTTP 401: invalid key sk-test-0123456789abcdef01234567
+```
+
+32 characters of the live key, in the clear. The cause: `.lines().next()` is a **structural** split
+on `\n` that the control-character filter never sees, and it runs *before* redaction. It deletes the
+second half of the key, so the surviving fragment no longer matches and `redact_secret`'s
+exact-substring replace finds nothing. The split point is sender-chosen, so the leaked prefix can be
+nearly the whole credential — a direct violation of Load-Bearing Invariant 6 and of this spec's A5.
+
+**Fix:** delete control characters — newlines included — across the whole message, with no line
+split. This rejoins the halves *before* redaction, restoring A5's ordering rule in its general form:
+**deletions before redaction, truncation after it.**
+
+The layout guarantee A2 relied on is unchanged and now *structural*: the result is a single line
+because no newline survives, rather than because everything after the first was discarded. The
+observable difference is that a multi-line body's later lines are joined on rather than dropped,
+still bounded by `DETAIL_MAX_CHARS`. For the JSON envelopes all five providers send this is a no-op
+— those messages are single-line. For a proxy's HTML or `text/plain` page it is a mild improvement,
+since the status phrase usually sits on a later line. Attacker capability is unchanged: a sender who
+wanted 200 characters of chosen text could always put them on line one.
+
+Pinned by `a_key_split_by_a_newline_in_the_body_is_still_redacted`; reverting `normalize_detail` to
+`.lines().next()` fails that test plus two others.
+
+**D2. The `ErrorPayload` variant-order comment was wrong and is corrected.** §5.3 claimed the
+untagged variant order is load-bearing. It is not: `Detailed` matches only a JSON object and `Text`
+only a JSON string, so the shapes are disjoint and serde resolves them regardless of declaration
+order. The code comment now says so. Object-first is a readability choice, not a constraint.
+
+**D3. `check_status`'s `(None, _)` match arms are unreachable in practice.** `error_for_status_ref`
+returns `Err` only for a 4xx/5xx, and that error always carries its status, so `status` is always
+`Some`. The arms are kept as the type's shape rather than removed — they cost nothing and avoid a
+panic if reqwest ever widens that constructor — and a comment now says they are not a live path.
