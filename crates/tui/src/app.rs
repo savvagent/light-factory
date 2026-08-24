@@ -536,6 +536,42 @@ impl App {
         self.key_probe_nonce
     }
 
+    /// Cancel and invalidate any in-flight `/key` verification probe.
+    ///
+    /// The seam for "the state this probe describes no longer holds". A probe answers one question
+    /// — *does the provider accept the key we just stored for it?* — and every part of that
+    /// question can be revoked while the answer is still in flight: the key can be cleared, the
+    /// session can end, the socket can drop. Without a single named call, each new teardown path
+    /// silently omits the probe: [`Self::next_key_probe_nonce`] had exactly one caller, so its
+    /// "bump and abort are one operation" rule was satisfied vacuously and said nothing about
+    /// whether every path that *should* cancel actually does.
+    ///
+    /// Bumping the generation is what discards a result already on the event channel; the abort
+    /// inside is what stops the request still carrying the API key. Both matter, and they are one
+    /// call for the reason they are one operation.
+    ///
+    /// Deliberately **not** hung on [`Self::dismiss_modals`]: `enter` calls that on the
+    /// sign-in-to-connected transition, and a probe started by a `/key` run before sign-in is
+    /// still answering a live question there.
+    fn cancel_key_probe(&mut self) {
+        self.next_key_probe_nonce();
+    }
+
+    /// Cancel every credential-bearing task the ending session leaves behind.
+    ///
+    /// The two cancellations sign-out and socket loss must both perform, named once so neither
+    /// site can acquire the other's bug. Both are requests holding an API key in memory and on the
+    /// wire, and both would otherwise land on a screen that has already been replaced — the model
+    /// fetch under a dismissed modal, the `/key` probe over `status.disconnected` or the sign-in
+    /// screen's status.
+    ///
+    /// Separate from [`Self::dismiss_modals`] rather than folded into it: `enter` dismisses modals
+    /// on a transition that ends no session, and must not cancel a live `/key` probe.
+    fn cancel_session_tasks(&mut self) {
+        self.dismiss_modals();
+        self.cancel_key_probe();
+    }
+
     /// Ask the provider whether the key just stored is one it accepts, off the UI loop.
     ///
     /// The probe is a model-list fetch because that is what the codebase has, what `/connect`
@@ -1089,6 +1125,12 @@ impl App {
         }
         match self.store.delete(provider) {
             Ok(()) => {
+                // The key the probe is asking about is gone, so every sentence it could still
+                // produce is now false — "accepted" describes a key we no longer hold, and both
+                // failure arms end in "it is still stored". Cancelled here rather than filtered by
+                // provider: a probe for some *other* provider is only a status the user has to
+                // read twice, and losing it costs nothing but the floor they already have.
+                self.cancel_key_probe();
                 self.rebuild_provider();
                 self.status = self.t_with("status.key_cleared", &[("provider", provider)]);
             }
@@ -1327,8 +1369,8 @@ impl App {
     async fn sign_out(&mut self) {
         // Before the logout await, not after. `self.api` is a `reqwest::Client::new()` with no
         // timeout, so a server that never answers `logout` would otherwise delay cancellation of
-        // the key-bearing model fetch indefinitely — the exact window the abort exists to close.
-        self.dismiss_modals();
+        // the key-bearing requests indefinitely — the exact window the abort exists to close.
+        self.cancel_session_tasks();
         if let Some(session) = &self.session {
             let _ = self.api.logout(&session.token).await;
         }
@@ -1366,7 +1408,10 @@ impl App {
                     self.session = None;
                     self.mode = Mode::SignIn;
                     self.focus = Focus::Email;
-                    self.dismiss_modals();
+                    // After `self.status` is set, and cancelling the `/key` probe is why the order
+                    // is safe either way: a late probe result would otherwise overwrite
+                    // `status.disconnected` with a sentence about a session that is gone.
+                    self.cancel_session_tasks();
                     self.error = Some(text);
                 }
             }
@@ -3941,6 +3986,92 @@ mod tests {
         assert!(
             app.key_probe.is_none(),
             "the aborted handle must be dropped"
+        );
+    }
+
+    /// Clearing the key is the natural next move after pasting the wrong one, and it used to
+    /// produce the exact failure #61 exists to remove: "API key cleared for openai", then fifteen
+    /// seconds later "openai accepted the API key" — a confident sentence about a key that is no
+    /// longer stored. The failure arms were worse: both end in "it is still stored".
+    #[tokio::test]
+    async fn clearing_a_key_cancels_the_in_flight_probe() {
+        let store = Arc::new(MemStore::new());
+        store.set("openai", "sk-test-key").unwrap();
+        let mut app = test_app_with_store(store);
+        let (handle, probe) = pending_task();
+        app.key_probe = Some(handle);
+        app.key_probe_nonce = 7;
+
+        app.clear_key("openai");
+
+        settle(&probe).await;
+        assert!(
+            probe.is_finished(),
+            "the request still carries the key that was just deleted"
+        );
+        assert!(app.key_probe.is_none());
+
+        // The generation moved too, so a result already on the channel is discarded rather than
+        // rendered over the sentence that is true.
+        app.handle_key_probed(7, "openai".to_string(), Ok(()));
+        assert_eq!(app.status, "API key cleared for openai");
+    }
+
+    /// Sign-out's half of the same gap, driven through `cancel_session_tasks` rather than
+    /// `sign_out`: `sign_out` calls `Session::clear`, which deletes the developer's real
+    /// `$XDG_CONFIG_HOME/light-factory/session.json`, and no test in this workspace mutates the
+    /// process environment to redirect it. `cancel_session_tasks` is the whole of what `sign_out`
+    /// does before the unbounded logout await, which is where the window is: `self.api` has no
+    /// timeout, so a server that never answers would hold a live API key in task memory and on the
+    /// wire indefinitely past the session that authorised it.
+    #[tokio::test]
+    async fn ending_the_session_cancels_the_in_flight_probe() {
+        let mut app = test_app();
+        let (probe_handle, probe) = pending_task();
+        let (fetch_handle, fetch) = pending_task();
+        app.key_probe = Some(probe_handle);
+        app.key_probe_nonce = 7;
+        app.modal.track_fetch(fetch_handle);
+        app.status = "sentinel".to_string();
+
+        app.cancel_session_tasks();
+
+        settle(&probe).await;
+        settle(&fetch).await;
+        assert!(probe.is_finished(), "the `/key` probe outlived the session");
+        assert!(fetch.is_finished(), "the model fetch outlived the session");
+
+        app.handle_key_probed(7, "openai".to_string(), Ok(()));
+        assert_eq!(
+            app.status, "sentinel",
+            "a late probe must not overwrite the sign-in screen's status"
+        );
+    }
+
+    /// The socket dropping ends the session just as definitively, and the status it sets —
+    /// `status.disconnected` — is the one a late probe would replace with news about a provider.
+    #[tokio::test]
+    async fn losing_the_socket_cancels_the_in_flight_probe() {
+        let mut app = test_app();
+        app.mode = Mode::Connected;
+        let (handle, probe) = pending_task();
+        app.key_probe = Some(handle);
+        app.key_probe_nonce = 7;
+
+        app.handle_server(ServerMessage::Error {
+            code: "ws_closed".to_string(),
+            message: "server closed the connection".to_string(),
+        });
+
+        settle(&probe).await;
+        assert!(probe.is_finished(), "the probe outlived the connection");
+        let disconnected = app.status.clone();
+        assert!(!disconnected.is_empty());
+
+        app.handle_key_probed(7, "openai".to_string(), Ok(()));
+        assert_eq!(
+            app.status, disconnected,
+            "a late probe must not overwrite the disconnected status"
         );
     }
 
