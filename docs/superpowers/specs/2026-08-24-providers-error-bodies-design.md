@@ -7,6 +7,9 @@
 > **Implements:** https://github.com/savvagent/light-factory/issues/59
 > **Follows:** https://github.com/savvagent/light-factory/issues/47 (the error classes this feeds),
 > https://github.com/savvagent/light-factory/issues/44 (the fetch bounds this extends)
+> **Related:** https://github.com/savvagent/light-factory/issues/58 (the typed-error seam #59 calls
+> "the sibling issue"), https://github.com/savvagent/light-factory/issues/62 (the completion path's
+> missing bounds — the natural home for the completion-path half of this, see §10 R2)
 
 ## 1. Brief
 
@@ -105,7 +108,10 @@ top", and pins `class_for_status(Some(400)) == Fetch` with a test in `crates/tui
 this PR is forbidden to edit. Rationale: the whole classification apparatus lives in `crates/tui`;
 there is no consumer in `crates/providers` for a classification produced there, and adding an
 unused public `FetchFailure`-shaped type to `providers` would be a new public interface built for
-nobody — YAGNI, and semver surface that outlives the decision. Signature-matching a body is also a
+nobody — YAGNI, and semver surface that outlives the decision. That seam has its own issue (#58,
+"expose a typed model-list error instead of making the TUI downcast"), which is where it belongs;
+#59 itself says "depends on the seam in the sibling issue if classification moves to `providers`",
+and that seam is not built yet. Signature-matching a body is also a
 *policy* choice with a false-positive cost (a 400 misrouted into a terminal step costs the user both
 remedies), and the issue is explicit that such a widening must be made deliberately. Once this PR
 lands, the body text is present in the error string that `crates/tui` already reads, so a follow-up
@@ -393,8 +399,11 @@ sentence off the rendered line with every test still green.
 **R2. The completion paths still discard their error bodies.** `anthropic.rs:102`,
 `gemini.rs:127`, `ollama.rs:69`, and `openai_compatible.rs:70` all end in `error_for_status()?`.
 Deliberately out of scope: the issue names `models.rs`, those errors surface on a different UI path
-with a different rendering boundary, and widening the diff would collide with concurrent work.
-**Follow-up to file:** "providers: capture error bodies on the completion paths too".
+with a different rendering boundary, and widening the diff would collide with concurrent work. The
+completion path already has an open issue for its missing bounds — #62, "providers: the completion
+path has no body cap and no deadline" — and error-body capture there depends on the same
+`read_capped`-equivalent that #62 must introduce, so it belongs in that issue rather than in a new
+one. **Action:** add a note to #62 rather than filing a duplicate.
 
 **R3. `reqwest::Error`'s Display includes the request URL, unredacted.** If a provider ever moved
 its key into a query parameter, the key would appear in the error via the source chain — with or
