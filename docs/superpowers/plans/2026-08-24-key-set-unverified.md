@@ -250,6 +250,33 @@ retires `status.key_set`.
 
 ---
 
+### Task 3: Close the review findings (§13 of the spec)
+
+Added after review. Depends on Task 2 landing; each item is a distinct commit.
+
+- [x] **The cancellation seam.** Add `cancel_key_probe` (bump the generation, abort the handle) and
+      `cancel_session_tasks` (that plus `dismiss_modals`). Call `cancel_key_probe` from
+      `clear_key`'s `Ok` arm and `cancel_session_tasks` from `sign_out` (before the `logout` await)
+      and the `ws_closed` arm. **Do not** fold either into `dismiss_modals`: `enter` calls that on
+      the sign-in→connected transition and must not cancel a live probe. One test per call site
+      asserts the parked handle is aborted *and* that a result carrying the pre-cancel nonce leaves
+      the status alone. Spec §13.1–§13.2.
+- [x] **`/key` words its own outcomes.** Replace `e.class.needs_credentials()` in
+      `handle_key_probed` with an exhaustive `match` on `FetchFailure`; add
+      `status.key_unresolved` for `MissingKey` in both catalogs. Spec §13.3.
+- [x] **Weaken "accepted" when an env var shadows.** Add `key_verified_status(provider, KeyStatus)`
+      and `status.key_verified_shadowed` (both catalogs), interpolating
+      `light_factory_providers::env_key_var(provider)`. Match `KeyStatus` exhaustively. Spec §13.4.
+- [x] **Width guard.** `every_key_outcome_status_fits_an_eighty_column_title_row` in `i18n.rs`, and
+      shorten the EN/ES `status.key_unreachable` lines that were within two columns of the cap.
+      Spec §6.6.
+- [x] **Network safety by construction.** The `submit_key_entry` tests that let a probe spawn now
+      name `PROBE_SAFE_PROVIDER` (`"local"`), which `list_models` rejects at base-URL resolution
+      before any request is built — so the "never await after the spawn" convention is belt and
+      braces rather than the only guard. Spec §9, and the belt-and-braces note under test 9.
+
+---
+
 ## Out-of-band surfaces (Phase 5)
 
 None. This change touches no `Dockerfile`, no `fly.toml`, no `web/`, no

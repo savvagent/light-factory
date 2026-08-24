@@ -101,16 +101,21 @@ should tell them within seconds when it does not.
    verification. No code path produces an unqualified "saved/set" sentence for a key.
 2. The probe runs off the UI loop: `submit_key_entry` returns before any network I/O, the loop keeps
    drawing, and the result arrives as a `UiEvent`.
-3. A provider that refuses the credential (`FetchFailure::MissingKey` | `Auth`, i.e.
-   `FetchFailure::needs_credentials()`) produces a status distinct from both the stored-unverified
-   status and the accepted status.
+3. A provider that refuses the credential (`FetchFailure::Auth`) produces a status distinct from
+   both the stored-unverified status and the accepted status.
 4. A transport failure (`FetchFailure::Fetch` — DNS, TLS, timeout, 5xx, a panic in the fetch)
-   produces a third, distinct status that does not accuse the key.
+   produces a distinct status that does not accuse the key, and so does a probe that resolved no
+   key to send (`FetchFailure::MissingKey`). Each class is worded here, by an exhaustive match, not
+   inherited from a predicate the modal owns. (§13.3)
 5. The key stays in the store after every probe outcome. Asserted by test against `MemStore`.
 6. No test reaches the network, and every test yields identical results with `OPENAI_API_KEY`
    exported.
 7. The key never appears in a status line, an error, a log, or `Debug` output — including the
    provider's own error text, which is not interpolated into any `/key` status.
+8. The probe never outlives the state it describes: clearing the key, signing out, and losing the
+   socket each cancel it and invalidate its result. (§13.2)
+9. The accepted status never claims more than the state supports: when an exported variable shadows
+   the keyring, it names the variable that requests will actually use. (§13.4)
 
 ## 5. The decision: honest wording, or a live probe?
 
@@ -236,14 +241,39 @@ fn handle_key_probed(&mut self, nonce: u64, provider: String, result: Result<(),
         return;
     }
     self.key_probe = None;
-    let key = match &result {
-        Ok(()) => "status.key_verified",
-        Err(e) if e.class.needs_credentials() => "status.key_rejected",
-        Err(_) => "status.key_unreachable",
+    let Err(e) = &result else {
+        let source = crate::selection::key_status(&provider, self.store.as_ref());
+        self.status = self.key_verified_status(&provider, source);
+        return;
+    };
+    let key = match e.class {
+        FetchFailure::Auth => "status.key_rejected",
+        FetchFailure::MissingKey => "status.key_unresolved",
+        FetchFailure::Fetch => "status.key_unreachable",
     };
     self.status = self.t_with(key, &[("provider", &provider)]);
 }
+
+/// Pure in the environment: the caller reads `key_status`, this decides the wording.
+fn key_verified_status(&self, provider: &str, source: KeyStatus) -> String {
+    let shadowing = match source {
+        KeyStatus::Env => light_factory_providers::env_key_var(provider),
+        KeyStatus::Keyring | KeyStatus::None => None,
+    };
+    match shadowing {
+        Some(var) => self.t_with(
+            "status.key_verified_shadowed",
+            &[("provider", provider), ("var", var)],
+        ),
+        None => self.t_with("status.key_verified", &[("provider", provider)]),
+    }
+}
 ```
+
+The error match is exhaustive on `FetchFailure` rather than a call to
+`FetchFailure::needs_credentials()`: that predicate answers the *modal's* question, and the two
+questions already diverge. See §13.3. Both matches are exhaustive so that a new `FetchFailure` or
+`KeyStatus` variant stops the build at the place that has to word it.
 
 `e.message` is deliberately not interpolated. It is provider-supplied text; the `/key` statuses are
 one bounded sentence each and carry only the provider id, which is not a secret. §4.7.
@@ -256,14 +286,20 @@ Dispatched from the event loop's `match` alongside `ModelsFetched`.
 |---|---|---|
 | `status.key_stored_unverified` | `API key stored for {provider} — not yet verified` | `Clave de API guardada para {provider} — aún sin verificar` |
 | `status.key_verified` | `{provider} accepted the API key` | `{provider} aceptó la clave de API` |
+| `status.key_verified_shadowed` | `{provider} accepted the key — but {var} is used` | `{provider} aceptó la clave, pero se usará {var}` |
 | `status.key_rejected` | `{provider} rejected the API key — it is still stored` | `{provider} rechazó la clave de API — sigue guardada` |
-| `status.key_unreachable` | `Couldn't reach {provider} to verify the API key — it is stored` | `No se pudo contactar con {provider} — la clave sigue guardada` |
+| `status.key_unresolved` | `No API key resolved for {provider} — nothing was checked` | `No se resolvió ninguna clave para {provider} — sin verificar` |
+| `status.key_unreachable` | `Couldn't reach {provider} to check the key — it is stored` | `No se pudo contactar con {provider} — sigue guardada` |
 
-The ES `status.key_unreachable` is deliberately not a literal translation. The status renders as one
-unwrapped `Paragraph` in the title row behind a 17-column `" light-factory · "` prefix
-(`app.rs:1383`); a literal ES translation totals 95 columns with `{provider}` = `openai` and would
-lose its trailing reassurance at 80 columns, while the EN string totals 75. Accented Spanish letters
-are written literally and em dashes as `\u{2014}`, matching the catalogs' existing convention.
+None of these is a literal translation of the other, and neither is free to grow. The status renders
+as one unwrapped `Paragraph` in the title row behind a 17-column `" light-factory · "` prefix
+(`app.rs:1383`), so the budget is 63 columns at the 80-column terminal the TUI targets — and what
+sits at the end of these lines is the qualification that makes each one honest ("it is still
+stored", "but {var} is used"). Measured against the longest pair the catalogs can carry
+(`anthropic` + `ANTHROPIC_API_KEY`), every line above fits, the widest at 59. That is no longer
+eyeballed: `i18n.rs`'s `every_key_outcome_status_fits_an_eighty_column_title_row` asserts it for
+both locales. Accented Spanish letters are written literally and em dashes as `\u{2014}`, matching
+the catalogs' existing convention.
 
 `status.key_set` is **removed** from both catalogs: `submit_key_entry:482` was its only reference
 (verified by `grep -rn "status.key_set" crates/`). The em dashes match `status.model_set_unverified`'s
@@ -279,6 +315,9 @@ existing `\u{2014}` form. None of these is a `*.footer`, so the 58-column cap do
 | `key_target` is `None` | Unchanged — returns to `key_return` with no status. |
 | Provider does not take a key | Unreachable: `begin_key_entry` gates on `takes_key` (`selection.rs:19`), so `key_target` is only ever `openai`/`anthropic`/`gemini`/`deepseek`. |
 | Second `/key` while a probe is in flight | Nonce bumped, previous handle aborted; the stale result (if it still sends) fails the nonce check and is dropped. |
+| `/key <provider> clear` while a probe is in flight | `cancel_key_probe`: the key the probe describes is gone, so every sentence it could still produce is false. §13.2. |
+| Sign-out or socket loss while a probe is in flight | `cancel_session_tasks` (modal fetch + probe), before sign-out's unbounded `logout` await. §13.2. |
+| An exported variable shadows the accepted key | `status.key_verified_shadowed` names the variable. §13.4. |
 | Probe outlives the `Mode::Key` screen | Expected — the status line is visible from every mode, so a late result lands somewhere the user can read it. |
 | Fetch panics | `fetch_model_list`'s `guard_panic` already yields `FetchFailure::Fetch` ⇒ `status.key_unreachable`. No new panic surface. |
 | Probe never completes | The 15s reqwest deadline inside `fetch_model_list` bounds it; until then the user reads the honest `status.key_stored_unverified`. |
@@ -291,6 +330,9 @@ existing `\u{2014}` form. None of these is a `*.footer`, so the 58-column cap do
   and into the probe task, and nowhere else. Every `/key` status takes `{provider}` and nothing else.
 - **The provider's error text does not reach the status line** (§6.5), so a provider that echoes part
   of a submitted credential in an error body cannot surface it through this path.
+- **A live key never outlives the session that authorised it.** Sign-out and socket loss cancel the
+  probe as well as the modal fetch, so no request carrying an API key survives into the sign-in
+  screen. §13.2.
 - **At most one probe in flight**, because each spawn aborts its predecessor (§6.4) — the same
   reasoning `handle_modal_key` records for the connect fetch ("the request — and the API key in its
   headers — would otherwise outlive the 'Esc: cancel' the footer promises").
@@ -320,12 +362,16 @@ light-factory-tui` must be identical.
    assertion lives in test 1 rather than being repeated here.
 3. `a_failed_keyring_write_starts_no_probe` — a failing store double leaves `key_probe.is_none()`
    and `key_probe_nonce == 0`.
-4. `an_accepted_key_reports_verification` — `handle_key_probed(nonce, "openai", Ok(()))` ⇒
-   `status.key_verified`.
+4. `an_accepted_key_reports_verification` — `handle_key_probed(nonce, "local", Ok(()))` ⇒
+   `status.key_verified`. `"local"` rather than `"openai"`: this arm now reads `key_status`, whose
+   answer for a provider with a declared env var depends on the ambient environment.
+   `an_accepted_key_names_the_variable_that_shadows_it` and
+   `an_accepted_key_with_nothing_shadowing_it_reports_plain_verification` cover the two sentences
+   by calling `key_verified_status` with an explicit `KeyStatus`. §13.4.
 5. `a_rejected_key_reports_rejection_and_stays_stored` — `Err(FetchError { class: Auth, .. })` ⇒
    `status.key_rejected`, and `store.get("openai")` still returns the key.
-6. `a_missing_key_class_reports_rejection` — `MissingKey` takes the same arm
-   (`needs_credentials()`), pinning the shared branch.
+6. `a_missing_key_class_is_not_reported_as_a_rejection` — `MissingKey` ⇒ `status.key_unresolved`,
+   and the status does not contain "rejected". §13.3.
 7. `an_unreachable_provider_does_not_accuse_the_key` — `Err(FetchError { class: Fetch, .. })` ⇒
    `status.key_unreachable`, distinct from both other error statuses, and the key stays stored.
 8. `a_stale_probe_result_is_discarded` — a result carrying `nonce - 1` leaves the status untouched.
@@ -341,7 +387,11 @@ light-factory-tui` must be identical.
    which is exactly what the two existing precedent tests do and say. Note that `submit_key_entry`
    does *not* re-check `takes_key`, so a test may set `key_target` to `"local"` directly even though
    the product path cannot.
-10. i18n: the existing `es_mirrors_en_exactly` covers the four new keys and the removed one.
+10. `clearing_a_key_cancels_the_in_flight_probe`, `ending_the_session_cancels_the_in_flight_probe`,
+    `losing_the_socket_cancels_the_in_flight_probe` — one per cancellation call site: the parked
+    handle is aborted, and a result carrying the pre-cancel nonce leaves the status alone. §13.2.
+11. i18n: `es_mirrors_en_exactly` covers the six new keys and the removed one, and
+    `every_key_outcome_status_fits_an_eighty_column_title_row` covers their rendered width. §6.6.
 
 Test 3 — and **only** test 3 — uses the `FailingStore` double that already exists at `app.rs:2037`
 (a `CredentialStore` whose `set` returns `Err` and whose `get` always returns `None`). No new double
@@ -368,10 +418,11 @@ is needed. Tests 5 and 7 assert the key *survives* via `store.get`, so they must
    submitted, which is what they asked about. The residual gap — an accepted keyring key that env
    shadowing means `/ask` will never use — is the sibling env-shadowing issue, and is why §6.6's
    accepted string says "accepted the API key" rather than "{provider} is ready".
-5. **A `MissingKey` class from a probe means rejection, not absence.** The probe supplies the key
-   explicitly, so `fetch_with_key`'s `None` arm is unreachable from this call site. Routing
-   `MissingKey` through `needs_credentials()` alongside `Auth` costs nothing and keeps the branch
-   from depending on that unreachability.
+5. ~~**A `MissingKey` class from a probe means rejection, not absence.**~~ **Withdrawn in review.**
+   The unreachability premise held; the conclusion did not. `MissingKey` means no key reached the
+   request, so the provider refused nothing — and borrowing `needs_credentials()` to say "rejected"
+   tied `/key`'s wording to a predicate that is being widened to mean "there is a credential-shaped
+   remedy". §13.3.
 6. **`status.key_set` has no external consumer.** It is a TUI catalog key in a binary crate; removal
    is not a public-API change.
 
@@ -391,7 +442,82 @@ is needed. Tests 5 and 7 assert the key *survives* via `store.get`, so they must
 
 ## 12. Follow-ups (not this change)
 
-- Env-shadowed keyring keys (the sibling issue): `/key` should say when the key it just stored will
-  be shadowed by an exported variable.
+- ~~Env-shadowed keyring keys (the sibling issue)~~ — **pulled forward in review** for the accepted
+  status only, where "accepted" is a claim about the provider that an exported variable makes
+  misleading. §13.4. The rest of the sibling issue (`/connect`, `/models`, the provider table)
+  stays out of scope.
 - Unifying `/connect`'s `KeyEntry` write with `submit_key_entry` so one function owns "store a key
   and say what happened". Blocked on #68 landing.
+
+## 13. Review round
+
+Three reviews of the implementation. The Rust pass approved; the architecture and security passes
+converged independently on one defect class, recorded as §13.1.
+
+### 13.1 The defect class: a probe's lifetime was not tied to the state that invalidates it
+
+`next_key_probe_nonce` had exactly one caller. Its rule — "bump and abort are one operation, so no
+call site can do one and forget the other" — was therefore satisfied vacuously: it said nothing
+about whether every path that *should* cancel actually did. None of the other teardown paths did.
+The result was this change's own bug, reproduced through a different door:
+
+```
+/key openai <wrong key>   →  "API key stored for openai — not yet verified"   (probe in flight, ≤15s)
+/key openai clear         →  "API key cleared for openai"
+                          →  "openai accepted the API key"
+```
+
+A confident sentence about a state that is not true, from the PR that exists to remove those. The
+failure arms are worse — both end in "it is still stored", which is now false — and the triggering
+sequence (paste, notice it is wrong, clear) is the ordinary one.
+
+### 13.2 The fix: one seam, three call sites
+
+`cancel_key_probe` bumps the generation and aborts the handle. `cancel_session_tasks` pairs it with
+`dismiss_modals` for the two paths where the session itself ends. Call sites:
+
+| Site | Call | What was wrong |
+|---|---|---|
+| `clear_key`, `Ok` arm | `cancel_key_probe` | §13.1. |
+| `sign_out`, before the `logout` await | `cancel_session_tasks` | `sign_out` already dismissed modals *before* that await, with a comment naming the reason: `self.api` has no timeout, so a server that never answers `logout` delays cancellation indefinitely. This change added a second key-bearing request and left that window open again. |
+| `handle_server`, `ws_closed` arm | `cancel_session_tasks` | A late probe overwrote `status.disconnected`. |
+
+Deliberately **not** hung on `dismiss_modals`: `enter` calls that on the sign-in→connected
+transition, and a probe started by a `/key` run before sign-in is still answering a live question
+there. `cancel_session_tasks` is the narrower seam — "the session is ending" — and `enter` is not
+that.
+
+`sign_out` is covered through `cancel_session_tasks` rather than by driving `sign_out` itself:
+`sign_out` calls `Session::clear`, which deletes the developer's real
+`$XDG_CONFIG_HOME/light-factory/session.json`, and no test in this workspace mutates the process
+environment to redirect it. `cancel_session_tasks` is the whole of what `sign_out` does before the
+await, which is the part with the window in it. Making that call site directly testable needs an
+injected session path (the `settings_path` pattern), which also reaches `Session::save` on three
+other call sites — out of scope here, and noted in §12.
+
+### 13.3 `/key` owns its own wording
+
+`handle_key_probed` mapped `e.class.needs_credentials()` to `status.key_rejected`. On master that
+predicate is `matches!(self, MissingKey | Auth)`; PR #68 redefines it as `remedy_key().is_some()`
+over `{MissingKey, Auth, StoreUnavailable}`. The meaning shifts from "the provider refused the
+credential" to "there is a credential-shaped remedy" — and under the new definition `/key` would
+announce "openai rejected the API key" when the keyring could not be read at all.
+
+The two questions were never the same one. `MissingKey` already showed it: it needs credentials but
+is not a rejection, because nothing was sent and so nothing was refused. §6.5 now matches
+`FetchFailure` exhaustively, so a class added later is a compile error at the place that has to word
+it rather than a silent inheritance of the modal's taxonomy. `status.key_unresolved` is the honest
+wording for `MissingKey`.
+
+### 13.4 "Accepted" is a stronger claim than "saved"
+
+`resolve_key` prefers an exported `OPENAI_API_KEY` over the keyring for all real traffic, and the
+probe deliberately sends the typed key (Assumption 4). So a developer with that variable set reads
+"openai accepted the API key" and every subsequent request uses the environment credential. The bad
+case is not an error: the env key is valid but for a different account, so requests bill the wrong
+org, silently, behind a green confirmation. The old "saved" was a claim about a keyring and survived
+this; "accepted" is a claim about the provider and does not.
+
+The answer is already on the call path — `key_status(&provider, self.store.as_ref())` returns
+`KeyStatus::Env`, which `/key` already renders as "env" in its provider list — so this is one arm
+and one catalog pair, not the sibling issue (#60) in full.
