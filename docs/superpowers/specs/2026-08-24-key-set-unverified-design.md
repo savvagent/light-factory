@@ -196,15 +196,22 @@ Ok(()) => {
 `key` is moved into the probe rather than re-read, for the reason in Assumption 4. The `Err` arm,
 the empty-input arm, and the `key_target`/`key_input`/`mode` resets above them are untouched.
 
-### 6.4 `begin_key_probe`
+### 6.4 `next_key_probe_nonce` + `begin_key_probe`
 
 ```rust
-fn begin_key_probe(&mut self, provider: String, key: String) {
+/// Claim the next probe generation, cancelling and invalidating whatever probe was in flight.
+/// Bumping and aborting are one operation for the reason `ModalHost::next_fetch_nonce` gives:
+/// they are the same event, so no call site can perform one and forget the other.
+fn next_key_probe_nonce(&mut self) -> u64 {
     self.key_probe_nonce = self.key_probe_nonce.wrapping_add(1);
-    let nonce = self.key_probe_nonce;
     if let Some(previous) = self.key_probe.take() {
         previous.abort();
     }
+    self.key_probe_nonce
+}
+
+fn begin_key_probe(&mut self, provider: String, key: String) {
+    let nonce = self.next_key_probe_nonce();
     let events = self.events.clone();
     let store = self.store.clone();
     let lang = self.config.lang;
@@ -290,11 +297,14 @@ All in `crates/tui/src/app.rs`'s `#[cfg(test)] mod tests`, using `test_app_with_
 
 **No network, no ambient env.** The probe only ever targets a network provider (`takes_key` excludes
 `ollama`/`local`), so the network is kept out by *never polling the spawned task*: the
-`submit_key_entry` tests are `#[tokio::test]` on the default current-thread runtime and never
-`.await`, so the task is spawned and dropped unpolled. `handle_key_probed` is tested directly with
-synthetic `FetchError` values and touches no runtime at all. Nothing calls `resolve_key`, so
-`OPENAI_API_KEY` in the developer's environment is irrelevant to every assertion —
-`OPENAI_API_KEY=sk-test cargo test -p light-factory-tui` must be identical.
+`submit_key_entry` tests are `#[tokio::test]` on the default current-thread runtime and their bodies
+never `.await`, so the runtime driver never runs between the spawn and the end of the test and the
+task is dropped unpolled at shutdown. Any test that *does* await — test 9 — must therefore not go
+through `submit_key_entry`; it exercises `next_key_probe_nonce` directly, which spawns nothing.
+`handle_key_probed` is tested directly with synthetic `FetchError` values and touches no runtime at
+all. Nothing on any of these paths calls `resolve_key`, so `OPENAI_API_KEY` in the developer's
+environment is irrelevant to every assertion — `OPENAI_API_KEY=sk-test cargo test -p
+light-factory-tui` must be identical.
 
 1. `submitting_a_key_reports_it_as_unverified` — status is `status.key_stored_unverified`, and is
    *not* the old "saved" sentence.
@@ -311,14 +321,17 @@ synthetic `FetchError` values and touches no runtime at all. Nothing calls `reso
 7. `an_unreachable_provider_does_not_accuse_the_key` — `Err(FetchError { class: Fetch, .. })` ⇒
    `status.key_unverified`, distinct from both other error statuses, and the key stays stored.
 8. `a_stale_probe_result_is_discarded` — a result carrying `nonce - 1` leaves the status untouched.
-9. `a_second_key_submission_aborts_the_first_probe` — `#[tokio::test]`, `pending_task()` parked in
-   `key_probe`, a submission, then `settle()` on the abort handle. Mirrors
+9. `claiming_a_probe_nonce_aborts_the_previous_probe` — `#[tokio::test]` using the existing
+   `pending_task()` (`app.rs:2675`) and `settle()` (`app.rs:2681`) helpers: park the pending handle
+   in `key_probe`, call `next_key_probe_nonce()` **directly**, `settle()`, assert
+   `probe.is_finished()`. It must not go through `submit_key_entry`, because `settle()`'s yields
+   would then poll a real probe task and it would reach the network — which is the whole reason
+   §6.4 splits the nonce claim out as its own method. Mirrors
    `starting_a_models_fetch_aborts_the_previous_one`.
 10. i18n: the existing `es_mirrors_en_exactly` covers the four new keys and the removed one.
 
-A failing-store double is needed for test 3; `MemStore` always succeeds. It is a local
-`#[cfg(test)]` struct implementing `CredentialStore` with a `set` that returns `Err`, next to the
-tests that use it.
+Test 3 uses the `FailingStore` double that already exists at `app.rs:2037` (a `CredentialStore`
+whose `set` returns `Err`). No new double is needed.
 
 ## 10. Assumptions
 
