@@ -35,9 +35,9 @@ because #55 *already* introduced the honest form for the sibling case — `statu
 path claiming unqualified success.
 
 The machinery to do better already exists and is already used by the neighbouring path.
-`handle_modal_key` (`app.rs:915`) writes the key typed into the `/connect` modal's `KeyEntry` step
+`handle_modal_key` (`app.rs:881`) writes the key typed into the `/connect` modal's `KeyEntry` step
 and then transitions to a fetching `ModelList`, which spawns `fetch_model_list` with that key as
-`key_override` (`app.rs:949`, `app.rs:704`). So `/connect`'s key entry is verified by construction and
+`key_override` (the write is at `app.rs:918`, the spawn at `app.rs:949`, `begin_model_fetch` at `app.rs:704`). So `/connect`'s key entry is verified by construction and
 `/key`'s is not, even though both write the same keyring entry through the same `CredentialStore`.
 
 ## 2. Scope
@@ -239,7 +239,7 @@ fn handle_key_probed(&mut self, nonce: u64, provider: String, result: Result<(),
     let key = match &result {
         Ok(()) => "status.key_verified",
         Err(e) if e.class.needs_credentials() => "status.key_rejected",
-        Err(_) => "status.key_unverified",
+        Err(_) => "status.key_unreachable",
     };
     self.status = self.t_with(key, &[("provider", &provider)]);
 }
@@ -257,7 +257,7 @@ Dispatched from the event loop's `match` alongside `ModelsFetched`.
 | `status.key_stored_unverified` | `API key stored for {provider} — not yet verified` | `Clave de API guardada para {provider} — aún sin verificar` |
 | `status.key_verified` | `{provider} accepted the API key` | `{provider} aceptó la clave de API` |
 | `status.key_rejected` | `{provider} rejected the API key — it is still stored` | `{provider} rechazó la clave de API — sigue guardada` |
-| `status.key_unverified` | `Couldn't reach {provider} to verify the API key — it is stored` | `No se pudo contactar con {provider} para verificar la clave de API — está guardada` |
+| `status.key_unreachable` | `Couldn't reach {provider} to verify the API key — it is stored` | `No se pudo contactar con {provider} para verificar la clave de API — está guardada` |
 
 `status.key_set` is **removed** from both catalogs: `submit_key_entry:482` was its only reference
 (verified by `grep -rn "status.key_set" crates/`). The em dashes match `status.model_set_unverified`'s
@@ -274,9 +274,10 @@ existing `\u{2014}` form. None of these is a `*.footer`, so the 58-column cap do
 | Provider does not take a key | Unreachable: `begin_key_entry` gates on `takes_key` (`selection.rs:19`), so `key_target` is only ever `openai`/`anthropic`/`gemini`/`deepseek`. |
 | Second `/key` while a probe is in flight | Nonce bumped, previous handle aborted; the stale result (if it still sends) fails the nonce check and is dropped. |
 | Probe outlives the `Mode::Key` screen | Expected — the status line is visible from every mode, so a late result lands somewhere the user can read it. |
-| Fetch panics | `fetch_model_list`'s `guard_panic` already yields `FetchFailure::Fetch` ⇒ `status.key_unverified`. No new panic surface. |
+| Fetch panics | `fetch_model_list`'s `guard_panic` already yields `FetchFailure::Fetch` ⇒ `status.key_unreachable`. No new panic surface. |
 | Probe never completes | The 15s reqwest deadline inside `fetch_model_list` bounds it; until then the user reads the honest `status.key_stored_unverified`. |
 | App exits mid-probe | Handle dropped with the runtime; the floor status is the last thing written. |
+| `submit_key_entry` called outside a tokio runtime | Panics, as any `tokio::spawn` does. The only production caller is the async event loop, and the `/key` submit path has no existing test, so nothing breaks — but a future plain `#[test]` on it would panic. The repo already documents this hazard at `app.rs:3090`. |
 
 ## 8. Security properties
 
@@ -319,7 +320,7 @@ light-factory-tui` must be identical.
 6. `a_missing_key_class_reports_rejection` — `MissingKey` takes the same arm
    (`needs_credentials()`), pinning the shared branch.
 7. `an_unreachable_provider_does_not_accuse_the_key` — `Err(FetchError { class: Fetch, .. })` ⇒
-   `status.key_unverified`, distinct from both other error statuses, and the key stays stored.
+   `status.key_unreachable`, distinct from both other error statuses, and the key stays stored.
 8. `a_stale_probe_result_is_discarded` — a result carrying `nonce - 1` leaves the status untouched.
 9. `claiming_a_probe_nonce_aborts_the_previous_probe` — `#[tokio::test]` using the existing
    `pending_task()` (`app.rs:2675`) and `settle()` (`app.rs:2681`) helpers: park the pending handle
@@ -327,11 +328,18 @@ light-factory-tui` must be identical.
    `probe.is_finished()`. It must not go through `submit_key_entry`, because `settle()`'s yields
    would then poll a real probe task and it would reach the network — which is the whole reason
    §6.4 splits the nonce claim out as its own method. Mirrors
-   `starting_a_models_fetch_aborts_the_previous_one`.
+   `starting_a_models_fetch_aborts_the_previous_one`. **Belt and braces:** if a future revision ever
+   does route this test through a spawn, it must name a provider `list_models` rejects without I/O
+   (`"local"` — `providers/src/models.rs:152` bails with "unknown provider" before any request),
+   which is exactly what the two existing precedent tests do and say. Note that `submit_key_entry`
+   does *not* re-check `takes_key`, so a test may set `key_target` to `"local"` directly even though
+   the product path cannot.
 10. i18n: the existing `es_mirrors_en_exactly` covers the four new keys and the removed one.
 
-Test 3 uses the `FailingStore` double that already exists at `app.rs:2037` (a `CredentialStore`
-whose `set` returns `Err`). No new double is needed.
+Test 3 — and **only** test 3 — uses the `FailingStore` double that already exists at `app.rs:2037`
+(a `CredentialStore` whose `set` returns `Err` and whose `get` always returns `None`). No new double
+is needed. Tests 5 and 7 assert the key *survives* via `store.get`, so they must run against
+`MemStore`; routing them through `FailingStore` would make them vacuous.
 
 ## 10. Assumptions
 
@@ -347,7 +355,7 @@ whose `set` returns `Err`). No new double is needed.
    next `/key`.
 4. **The probe verifies the key the user just typed, not the key the app would resolve.** Passing
    `None` would let `fetch_model_list` call `resolve_key`, which prefers an exported
-   `OPENAI_API_KEY` over the keyring (`selection.rs:25`, `KeyStatus::Env`) — so a developer with the
+   `OPENAI_API_KEY` over the keyring (`resolve_key_from`, `selection.rs:82`, reached via `resolve_key`, `selection.rs:102`) — so a developer with the
    env var set would be told their newly typed keyring key was "accepted" on the strength of a
    different credential entirely. `Some(key)` makes the status a statement about the string the user
    submitted, which is what they asked about. The residual gap — an accepted keyring key that env
