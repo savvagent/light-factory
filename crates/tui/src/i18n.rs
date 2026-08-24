@@ -133,8 +133,12 @@ const EN: Catalog = &[
         "Could not read the stored key for {provider}: {error}",
     ),
     (
+        "provider.store.unavailable_all",
+        "Could not read the credential store: {error}",
+    ),
+    (
         "provider.offline.store_unavailable",
-        "Falling back to the offline provider: the credential store could not be read, so stored keys were unavailable",
+        "Falling back to the offline provider: the credential store could not be read, so stored keys were unavailable. Unlock it and restart, or set ANTHROPIC_API_KEY (or another provider's key) in the environment.",
     ),
     ("status.ask_empty", "Usage: /ask <prompt>"),
     (
@@ -445,8 +449,12 @@ const ES: Catalog = &[
         "No se pudo leer la clave guardada de {provider}: {error}",
     ),
     (
+        "provider.store.unavailable_all",
+        "No se pudo leer el almac\u{e9}n de credenciales: {error}",
+    ),
+    (
         "provider.offline.store_unavailable",
-        "Usando el proveedor sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales, as\u{ed} que las claves guardadas no estaban disponibles",
+        "Usando el proveedor sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales, as\u{ed} que las claves guardadas no estaban disponibles. Desbloqu\u{e9}alo y reinicia, o define ANTHROPIC_API_KEY (o la clave de otro proveedor) en el entorno.",
     ),
     ("status.ask_empty", "Uso: /ask <indicación>"),
     (

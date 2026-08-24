@@ -476,7 +476,7 @@ impl App {
                 self.status = self.t_with("status.key_set", &[("provider", &provider)]);
             }
             Err(e) => {
-                let error = e.to_string();
+                let error = crate::text::one_line(&format!("{e:#}"));
                 self.error = Some(self.t_with(
                     "status.key_failed",
                     &[("provider", &provider), ("error", &error)],
@@ -949,7 +949,7 @@ impl App {
         {
             let key_value = input.trim().to_string();
             if let Err(e) = self.store.set(provider, &key_value) {
-                let err = e.to_string();
+                let err = crate::text::one_line(&format!("{e:#}"));
                 self.error = Some(self.t_with(
                     "status.key_failed",
                     &[("provider", provider.as_str()), ("error", &err)],
@@ -1027,7 +1027,7 @@ impl App {
                 self.status = self.t_with("status.key_cleared", &[("provider", provider)]);
             }
             Err(e) => {
-                let error = e.to_string();
+                let error = crate::text::one_line(&format!("{e:#}"));
                 self.error = Some(self.t_with(
                     "status.key_failed",
                     &[("provider", provider), ("error", &error)],

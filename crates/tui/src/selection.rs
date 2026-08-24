@@ -10,7 +10,7 @@ use light_factory_tui::credentials::CredentialStore;
 
 use crate::provider::{ProviderInfo, StoreFailure};
 use crate::settings::Settings;
-use crate::text::one_line;
+use crate::text::{one_line, truncate_chars};
 
 /// The remote provider ids, in key-precedence order.
 pub const REMOTE_IDS: [&str; 4] = ["anthropic", "openai", "gemini", "deepseek"];
@@ -39,14 +39,21 @@ fn env_key(provider: &str, env: impl Fn(&str) -> Option<String>) -> Option<Strin
         .filter(|k| !k.is_empty())
 }
 
+/// The longest store-failure text any consumer renders. The engine log clips rather than wraps, so
+/// an uncapped line loses its tail silently; the modal has its own, tighter cap on top.
+const STORE_ERROR_MAX_CHARS: usize = 160;
+
 /// The store's answer for `provider`, with a failure reduced to one display-ready line.
 ///
 /// `{:#}` keeps anyhow's source chain, so the cause (no D-Bus session, a locked wallet) survives
 /// rather than only the outermost "failed". [`one_line`] strips control characters because this
 /// text is written into a terminal cell, where a raw `ESC` is an escape-sequence injection. The
-/// length cap belongs to the modal, which already owns it.
+/// length cap is applied here, at the seam, so both consumers inherit it — the modal narrows it
+/// further for its own tighter row.
 fn read_store(provider: &str, store: &dyn CredentialStore) -> Result<Option<String>, String> {
-    store.get(provider).map_err(|e| one_line(&format!("{e:#}")))
+    store
+        .get(provider)
+        .map_err(|e| truncate_chars(&one_line(&format!("{e:#}")), STORE_ERROR_MAX_CHARS))
 }
 
 /// Where a provider's key comes from, for the `/key` listing and the `/connect` rows.
@@ -257,6 +264,21 @@ mod tests {
         assert_eq!(
             read_store("openai", &store),
             Err("locked wallet".to_string())
+        );
+    }
+
+    /// The cap belongs at the seam, not at one of the two consumers: the engine-log path never
+    /// capped, so a verbose keyring error reached it unbounded.
+    #[test]
+    fn read_store_bounds_a_verbose_failure() {
+        let store = FailingStore::new("x".repeat(10_000));
+        let Err(error) = read_store("openai", &store) else {
+            panic!("a failing store must not answer Ok");
+        };
+        assert!(
+            error.chars().count() <= STORE_ERROR_MAX_CHARS + 1,
+            "{}",
+            error.chars().count()
         );
     }
 
