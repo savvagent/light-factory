@@ -1806,3 +1806,369 @@ Expected: all green; clippy clean. The `crates/persistence` integration test ski
   already takes a locale-bearing `ModalContext`), replaced with the real argument — the carried
   `remedy` follows the sibling `error` field that `app.rs` already precomputes; and the render arm's
   reference to "the input box", which belongs to `ModelsStep::Manual`, not `Credentials`.
+
+---
+
+# Round 2 — findings from the PR #68 agent review
+
+Eight reviewers ran against the opened PR. Two Critical findings mean the change does not deliver
+acceptance criterion (b) on the *primary* path — a keyring that is already locked when the TUI
+starts. The tasks below close them, plus the Important tier. Task order matters: Task 8 builds the
+remedy seam that Task 9 needs.
+
+Deferred to follow-up issues rather than fixed here: `KeyStatus::Unavailable` carrying its cause so
+`/key` is actionable; surfacing store failures outside the engine pane; an `ErrorLine` newtype; a
+`FetchError::sanitized` chokepoint; an env-injection seam for `fetch_model_list`; moving the binary
+modules into the library so `FailingStore` can be `#[cfg(test)]`.
+
+---
+
+### Task 7: Report the store on `/models` when the fallback already happened
+
+**Critical.** `enter_models` short-circuits on `provider_info.offline.is_some()` before any fetch, so
+with the keyring locked at startup the user sees `models.offline` — "Use /connect to connect a
+provider first" — which is the original bug verbatim: it names no fault and points at a flow that
+writes to the store that just failed. `FetchFailure::StoreUnavailable` is currently reachable only
+in the narrower mid-session window. `self.provider_info.store_failures` is in scope one line above
+and is ignored.
+
+**Files:** `crates/tui/src/app.rs`.
+
+- [ ] **Step 1: Failing test** in `app.rs`'s `mod tests`:
+
+```rust
+    /// The headline case from #51: the keyring is already locked when the TUI starts, so
+    /// `rebuild` records the failures, no key resolves, and the provider is offline before
+    /// `/models` is ever opened. The offline step would send the user to `/connect`, which writes
+    /// to the same unreadable store.
+    #[test]
+    fn models_reports_the_store_when_the_offline_fallback_was_its_fault() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.provider_info.store_failures = vec![crate::provider::StoreFailure {
+            provider: "openai".to_string(),
+            error: "no D-Bus session".to_string(),
+        }];
+        app.enter_models();
+        let Some(ModelsStep::Credentials { error, .. }) = models_step(&app) else {
+            panic!("expected the credentials step, got {:?}", models_step(&app));
+        };
+        assert!(error.contains("openai") && error.contains("no D-Bus session"), "{error}");
+    }
+
+    /// Offline for a reason that is not the store still gets the plain offline step.
+    #[test]
+    fn models_still_reports_offline_when_no_store_failed() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.enter_models();
+        assert!(matches!(models_step(&app), Some(ModelsStep::Offline)));
+    }
+```
+
+`enter_models` opens the modal through `open_modal`, which spawns a fetch only when the step names a
+fetch target. `ModelsStep::Credentials` and `ModelsStep::Offline` both name `None`, so neither test
+needs a runtime.
+
+- [ ] **Step 2:** Run `cargo test -p light-factory-tui models_reports` — expect FAIL (the first test
+      gets `ModelsStep::Offline`).
+
+- [ ] **Step 3:** In `enter_models`, replace the offline arm and add the helper next to it:
+
+```rust
+        if self.provider_info.offline.is_some() {
+            let step = self.offline_models_step();
+            self.open_modal(Modal::Models(step), None);
+            return;
+        }
+```
+
+```rust
+    /// The step `/models` opens when no live provider is active.
+    ///
+    /// A store failure recorded by the last `rebuild` is *why* there is no key, so the plain
+    /// offline step — "use /connect first" — would send the user into a flow that writes to the
+    /// same unreadable store. Report the store instead, on the step that carries a remedy and a
+    /// Ctrl+R that re-reads it.
+    fn offline_models_step(&self) -> ModelsStep {
+        let Some(failure) = self.provider_info.store_failures.first() else {
+            return ModelsStep::Offline;
+        };
+        ModelsStep::Credentials {
+            error: self.t_with(
+                "provider.store.unavailable",
+                &[("provider", &failure.provider), ("error", &failure.error)],
+            ),
+            class: FetchFailure::StoreUnavailable,
+            provider: failure.provider.clone(),
+        }
+    }
+```
+
+**Note:** the `class` field replaces `remedy` in Task 8, which lands first. If Task 8 has not landed
+when you implement this, use `remedy: self.credentials_remedy(&failure.provider,
+FetchFailure::StoreUnavailable)` instead and Task 8 will convert it.
+
+- [ ] **Step 4:** `cargo test -p light-factory-tui` — expect PASS.
+- [ ] **Step 5:** `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all`, commit
+      as `tui: report the credential store on /models when it caused the offline fallback`.
+
+---
+
+### Task 8: Derive the credential remedy from the class at render time
+
+The credentials step carries a **pre-localized** `remedy: String`, which (a) goes stale when `/lang`
+changes the locale on an open modal, (b) costs seven meaningless `remedy: "remedy".to_string()`
+fixture lines, (c) put the class-based branch in `app.rs` even though `FetchFailure` is defined in
+`modal.rs`, and (d) leaves `credentials_remedy`'s `FetchFailure::Fetch` arm pre-committing an
+unreachable class to the `/connect`-`/key` remedy — the exact inheritance its own doc comment
+forbids. Task 9 also needs the remedy from a second render site, which a stored string cannot serve.
+
+**Files:** `crates/tui/src/modal.rs`, `crates/tui/src/app.rs`.
+
+- [ ] **Step 1: Failing test** in `modal.rs`'s `mod tests`:
+
+```rust
+    /// Every credential class names a remedy, and a store failure's differs from the one the
+    /// key-shaped failures get — `/connect` and `/key` both write to the store that just failed.
+    #[test]
+    fn every_credential_class_names_its_own_remedy() {
+        for class in [FetchFailure::MissingKey, FetchFailure::Auth, FetchFailure::StoreUnavailable] {
+            assert!(class.remedy_key().is_some(), "{class:?} has no remedy");
+        }
+        assert_eq!(FetchFailure::Fetch.remedy_key(), None, "a retryable failure has no remedy");
+        assert_ne!(
+            FetchFailure::StoreUnavailable.remedy_key(),
+            FetchFailure::MissingKey.remedy_key()
+        );
+    }
+
+    /// The rendered remedy follows the locale in force at render time, not the one that happened
+    /// to be set when the step was built — `/lang` can change it while the modal is open.
+    #[test]
+    fn the_credentials_remedy_is_rendered_in_the_current_locale() {
+        let step = ModelsStep::Credentials {
+            provider: "openai".to_string(),
+            error: "refused".to_string(),
+            class: FetchFailure::Auth,
+        };
+        let en = models_view(&step, &ctx(Locale::En));
+        let es = models_view(&step, &ctx(Locale::Es));
+        assert_ne!(body_text(&en), body_text(&es));
+    }
+```
+
+Add whatever small `ctx(locale)` / `body_text(view)` helpers the module needs (concatenate each
+`Line`'s span contents), or reuse existing ones if present.
+
+- [ ] **Step 2:** Run `cargo test -p light-factory-tui` — expect FAIL to compile.
+
+- [ ] **Step 3:** Add to `impl FetchFailure` in `modal.rs`:
+
+```rust
+    /// The i18n key of the remedy for this class, or `None` when the remedy is simply to retry.
+    ///
+    /// This is the single statement of "what can the user do about it": `needs_credentials` is
+    /// `remedy_key().is_some()`, and both render sites look the string up here rather than
+    /// carrying a pre-localized copy that `/lang` would leave stale.
+    pub(crate) fn remedy_key(self) -> Option<&'static str> {
+        match self {
+            // `/connect` and `/key` both write to the credential store, so neither is a remedy
+            // for a store that cannot be read.
+            FetchFailure::StoreUnavailable => Some("models.store_remedy"),
+            FetchFailure::MissingKey | FetchFailure::Auth => Some("models.credentials_remedy"),
+            FetchFailure::Fetch => None,
+        }
+    }
+```
+
+and redefine the predicate in terms of it, deleting the `matches!` (this is also the architect's
+finding that a fifth variant would silently answer `false` and land on the model-id text box):
+
+```rust
+    pub(crate) fn needs_credentials(self) -> bool {
+        self.remedy_key().is_some()
+    }
+```
+
+- [ ] **Step 4:** Replace `ModelsStep::Credentials`'s `remedy: String` field with
+      `class: FetchFailure`, updating its doc comment: the step carries the *class* so the render
+      stays locale-correct and the branch stays in the module that defines the enum.
+
+- [ ] **Step 5:** In `models_view`'s `Credentials` arm, bind `{ provider, error, class }` and
+      replace the `remedy.clone()` push with a lookup:
+
+```rust
+            if let Some(key) = class.remedy_key() {
+                lines.push(Line::from(Span::styled(
+                    i18n::t_with(ctx.locale, key, &[("provider", provider)]),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+```
+
+- [ ] **Step 6:** Delete `App::credentials_remedy` and its two tests
+      (`a_store_failure_gets_its_own_remedy`, `every_credential_class_has_a_remedy` — Step 1
+      replaces both at the layer that now owns the decision). In `handle_models_fetched`, build the
+      step with `class: err.class` instead of the computed remedy. Update every
+      `ModelsStep::Credentials` construction in both files' tests: `remedy: "remedy".to_string()`
+      becomes `class: FetchFailure::Auth` (or whichever class that test means).
+
+- [ ] **Step 7:** `cargo test -p light-factory-tui`, `cargo clippy --workspace --all-targets -- -D warnings`,
+      `cargo fmt --all`. Commit as `tui: derive the credential remedy from the failure class`.
+
+---
+
+### Task 9: Carry the failure class into the `/connect` modal
+
+**Critical.** `begin_model_fetch` throws the class away (`result.map_err(|e| e.message)`) and
+`handle_connect_models` wraps unconditionally in `connect.fetch_error`, so a store failure renders as
+*"Couldn't fetch models: the credential store for openai could not be read: no D-Bus session"* — the
+exact double-wrap `fetch_error_message` exists to prevent, and which
+`a_store_failure_message_is_passed_through_unwrapped` asserts against on the sibling sink. The remedy
+is unreachable from `/connect` entirely, and Esc routes a store failure to key entry
+(`from_key || error.is_some()`) as though the user had mistyped a key. Task 5 is what routes
+`RowKey::Unavailable` into this sink, so this PR is what made it reachable.
+
+**Files:** `crates/tui/src/app.rs`, `crates/tui/src/modal.rs`.
+
+- [ ] **Step 1: Failing tests** in `app.rs`'s `mod tests`:
+
+```rust
+    /// The `/connect` sink must not re-wrap a sentence that already names the provider and the
+    /// cause: "Couldn't fetch models: the credential store for openai could not be read: ...".
+    #[test]
+    fn connect_does_not_double_wrap_a_store_failure() {
+        let mut app = test_app();
+        let nonce = open(&mut app, Modal::Connect(model_list_step(vec![], true)));
+        app.handle_connect_models(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(FetchFailure::StoreUnavailable, "store for openai could not be read")),
+        );
+        let Some(ConnectStep::ModelList { error, remedy, .. }) = connect_step(&app) else {
+            panic!("expected the model list, got {:?}", connect_step(&app));
+        };
+        let error = error.as_deref().expect("a failed fetch sets an error");
+        assert!(!error.contains("Couldn't fetch models"), "double-wrapped: {error}");
+        assert!(remedy.is_some(), "a credential-class failure must offer its remedy");
+    }
+
+    /// A transport failure keeps the wrapper it has always had, and offers no remedy.
+    #[test]
+    fn connect_still_wraps_a_transport_error() {
+        let mut app = test_app();
+        let nonce = open(&mut app, Modal::Connect(model_list_step(vec![], true)));
+        app.handle_connect_models(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(FetchFailure::Fetch, "connection refused")),
+        );
+        let Some(ConnectStep::ModelList { error, remedy, .. }) = connect_step(&app) else {
+            panic!("expected the model list");
+        };
+        assert!(error.as_deref().unwrap().contains("connection refused"));
+        assert_eq!(*remedy, None);
+    }
+```
+
+and in `modal.rs`'s `mod tests`:
+
+```rust
+    /// Esc after a store failure must not land on the key field: the user did not mistype a key,
+    /// and writing one would fail against the same unreadable store.
+    #[test]
+    fn esc_after_a_store_failure_returns_to_the_provider_list() {
+        let step = ConnectStep::ModelList {
+            rows: vec![row("openai", RowKey::Unavailable)],
+            provider: "openai".to_string(),
+            models: Vec::new(),
+            selected: 0,
+            fetching: false,
+            error: Some("could not be read".to_string()),
+            failure: Some(FetchFailure::StoreUnavailable),
+            remedy: None,
+            from_key: false,
+        };
+        let ModalTransition::Step(Modal::Connect(next)) = connect_step_next(&step, key(KeyCode::Esc))
+        else {
+            panic!("Esc must step");
+        };
+        assert!(matches!(next, ConnectStep::ProviderList { .. }), "got {next:?}");
+    }
+```
+
+(Adjust the literal to whatever field set Step 3 settles on — `remedy` is dropped if the class alone
+drives the render.)
+
+- [ ] **Step 2:** Run `cargo test -p light-factory-tui` — expect FAIL to compile.
+
+- [ ] **Step 3:** Give `ConnectStep::ModelList` a `failure: Option<FetchFailure>` field beside
+      `error: Option<String>`, documented as: the class that produced `error`, so the step can offer
+      the same class-specific remedy `/models` does and decide where Esc goes. Set it to `None` at
+      every construction site in `connect_step_next` and in tests.
+
+- [ ] **Step 4:** Stop discarding the class in `begin_model_fetch`:
+
+```rust
+                FetchSink::Connect => UiEvent::ConnectModels { nonce, provider, result },
+```
+
+and widen `UiEvent::ConnectModels`'s `result` to `Result<Vec<String>, FetchError>`. Delete the
+now-false comment about the connect modal rendering only the message.
+
+- [ ] **Step 5:** In `handle_connect_models`, classify before taking the mutable borrow:
+
+```rust
+        let outcome = match result {
+            Ok(list) => Ok(list),
+            Err(e) => Err((self.fetch_error_message(&provider, &e), e.class)),
+        };
+        if let Some(Modal::Connect(ConnectStep::ModelList {
+            models, selected, fetching, error, failure, ..
+        })) = self.modal.current_mut()
+        {
+            *fetching = false;
+            match outcome {
+                Ok(list) => {
+                    *models = list;
+                    *selected = 0;
+                    *error = None;
+                    *failure = None;
+                }
+                Err((message, class)) => {
+                    *error = Some(message);
+                    *failure = Some(class);
+                }
+            }
+        }
+```
+
+- [ ] **Step 6:** In `connect_view`'s `ModelList` arm, push the remedy above the error, so the
+      trusted row survives clipping ahead of the foreign one:
+
+```rust
+            } else if let Some(err) = error {
+                if let Some(key) = failure.and_then(FetchFailure::remedy_key) {
+                    lines.push(Line::from(Span::styled(
+                        i18n::t_with(ctx.locale, key, &[("provider", provider)]),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red))));
+            }
+```
+
+- [ ] **Step 7:** Exclude a store failure from the "back to the key field" rule in
+      `connect_step_next`'s `ModelList` Esc arm:
+
+```rust
+                let mistyped_key = *from_key || error.is_some();
+                // A store failure is not a mistyped key: the field would take one and then fail to
+                // write it to the same unreadable store.
+                let store_failed = *failure == Some(FetchFailure::StoreUnavailable);
+                if !*fetching && takes_key(provider) && mistyped_key && !store_failed {
+```
+
+- [ ] **Step 8:** `cargo test -p light-factory-tui`, `OPENAI_API_KEY=sk-test cargo test -p light-factory-tui`,
+      clippy, `cargo fmt --all`. Commit as `tui: carry the failure class into the connect modal`.
