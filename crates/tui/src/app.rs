@@ -3754,8 +3754,12 @@ mod tests {
     /// A `tokio::test` because `submit_key_entry` spawns the verification probe, and the body
     /// deliberately never awaits: on the current-thread test runtime nothing drives the run queue
     /// between the spawn and the end of the test, so the probe is dropped unpolled and no request
-    /// is issued. Nothing on this path calls `resolve_key` either, so an exported `OPENAI_API_KEY`
-    /// cannot change either assertion.
+    /// is issued.
+    ///
+    /// Env-independent, but not because the path avoids the environment — `rebuild_provider` reads
+    /// `OPENAI_API_KEY` and friends through `selection_from_env`. It is independent because that
+    /// read reaches only `provider`/`provider_info`, and neither assertion here touches them. A
+    /// future assertion on `provider_info` would need its own isolation.
     #[tokio::test]
     async fn submitting_a_key_reports_it_as_stored_but_unverified() {
         let mut app = test_app();

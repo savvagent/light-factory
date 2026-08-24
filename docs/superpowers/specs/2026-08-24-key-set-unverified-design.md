@@ -257,7 +257,13 @@ Dispatched from the event loop's `match` alongside `ModelsFetched`.
 | `status.key_stored_unverified` | `API key stored for {provider} — not yet verified` | `Clave de API guardada para {provider} — aún sin verificar` |
 | `status.key_verified` | `{provider} accepted the API key` | `{provider} aceptó la clave de API` |
 | `status.key_rejected` | `{provider} rejected the API key — it is still stored` | `{provider} rechazó la clave de API — sigue guardada` |
-| `status.key_unreachable` | `Couldn't reach {provider} to verify the API key — it is stored` | `No se pudo contactar con {provider} para verificar la clave de API — está guardada` |
+| `status.key_unreachable` | `Couldn't reach {provider} to verify the API key — it is stored` | `No se pudo contactar con {provider} — la clave sigue guardada` |
+
+The ES `status.key_unreachable` is deliberately not a literal translation. The status renders as one
+unwrapped `Paragraph` in the title row behind a 17-column `" light-factory · "` prefix
+(`app.rs:1383`); a literal ES translation totals 95 columns with `{provider}` = `openai` and would
+lose its trailing reassurance at 80 columns, while the EN string totals 75. Accented Spanish letters
+are written literally and em dashes as `\u{2014}`, matching the catalogs' existing convention.
 
 `status.key_set` is **removed** from both catalogs: `submit_key_entry:482` was its only reference
 (verified by `grep -rn "status.key_set" crates/`). The em dashes match `status.model_set_unverified`'s

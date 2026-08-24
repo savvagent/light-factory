@@ -536,7 +536,7 @@ const ES: Catalog = &[
     ),
     (
         "status.key_unreachable",
-        "No se pudo contactar con {provider} para verificar la clave de API \u{2014} está guardada",
+        "No se pudo contactar con {provider} \u{2014} la clave sigue guardada",
     ),
     (
         "status.key_cleared",

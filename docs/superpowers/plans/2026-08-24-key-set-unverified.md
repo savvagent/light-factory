@@ -68,7 +68,7 @@ implements it exactly.
 
 | File | Responsibility |
 |---|---|
-| **Modify.** `crates/tui/src/i18n.rs` | Remove `status.key_set` from both catalogs; add `status.key_stored_unverified`, `status.key_verified`, `status.key_rejected`, `status.key_unverified` to both. |
+| **Modify.** `crates/tui/src/i18n.rs` | Remove `status.key_set` from both catalogs; add `status.key_stored_unverified`, `status.key_verified`, `status.key_rejected`, `status.key_unreachable` to both. |
 | **Modify.** `crates/tui/src/app.rs` | `submit_key_entry`'s `Ok` arm; new `key_probe_nonce` / `key_probe` fields (+ their `App::new` initialisers); new `UiEvent::KeyProbed` variant and its event-loop arm; new `next_key_probe_nonce`, `begin_key_probe`, `handle_key_probed`; new tests. |
 | **Untouched.** `crates/tui/src/modal.rs` | `fetch_model_list`, `FetchError`, `FetchFailure` are consumed as-is. |
 | **Untouched.** `crates/tui/src/selection.rs`, `provider.rs` | `takes_key` already gates `begin_key_entry`; nothing changes. |
@@ -104,8 +104,13 @@ retires `status.key_set`.
       `app.key_input = "sk-test-key".to_string()`, call `app.submit_key_entry()`, then assert
       `app.status == "API key stored for openai \u{2014} not yet verified"` and
       `app.store.get("openai").unwrap().as_deref() == Some("sk-test-key")`.
-      Add a doc comment on the test recording *why* it is env-independent: nothing on this path calls
-      `resolve_key`, so an exported `OPENAI_API_KEY` cannot change the assertion.
+      Add a doc comment on the test recording *why* it is env-independent — and get the reason
+      right. `submit_key_entry` **does** reach the environment: `rebuild_provider` →
+      `crate::selection::rebuild` → `selection_from_env` reads `OPENAI_API_KEY`,
+      `ANTHROPIC_API_KEY`, `LIGHT_REMOTE_PROVIDER` and the `LIGHT_*_MODEL` vars. The test is
+      independent because that read reaches only `provider`/`provider_info` and neither assertion
+      touches them — not because the path avoids the env. A future assertion on `provider_info`
+      would need its own isolation.
 - [ ] Run `cargo test -p light-factory-tui submitting_a_key_reports_it_as_unverified` — **expect
       failure**: the status is still `"API key saved for openai"`.
 - [ ] In `crates/tui/src/i18n.rs`, delete the `("status.key_set", …)` entry from the **EN** table
@@ -113,10 +118,11 @@ retires `status.key_set`.
 - [ ] In the same two tables, in the same positions, add
       `("status.key_stored_unverified", "API key stored for {provider} \u{2014} not yet verified")`
       (EN) and
-      `("status.key_stored_unverified", "Clave de API guardada para {provider} \u{2014} a\u{fa}n sin verificar")`
-      (ES). Write the em dash as `\u{2014}`, matching the existing `status.model_set_unverified`
-      entries; write the ES text with a literal `ú` if the file's other ES strings use literal
-      accented characters (check `status.key_enter`'s ES entry and match it).
+      `("status.key_stored_unverified", "Clave de API guardada para {provider} \u{2014} aún sin verificar")`
+      (ES). The file's convention, confirmed by reading it: **em dashes and arrows are always written as
+      `\u{...}` escapes** (`status.model_set_unverified`, `models.manual`, every footer), while
+      **accented Spanish letters are written literally** (`sesión`, `verificará`, `código`). Follow
+      both.
 - [ ] In `crates/tui/src/app.rs`'s `submit_key_entry`, change the `Ok(())` arm's status line from
       `self.t_with("status.key_set", …)` to `self.t_with("status.key_stored_unverified", …)`.
       Leave `rebuild_provider()`, the `Err` arm, the empty-input arm, and everything above the
@@ -126,6 +132,9 @@ retires `status.key_set`.
 - [ ] Run `cargo test -p light-factory-tui` — **expect pass**, including `es_mirrors_en_exactly` and
       `every_footer_fits_the_popup_in_both_locales`.
 - [ ] Run `OPENAI_API_KEY=sk-test cargo test -p light-factory-tui` — **expect the same pass**.
+- [ ] `cargo test -p light-factory-tui` alone suffices for this task: the removed catalog key has no
+      consumer outside `crates/tui`. The workspace run is Task 2's gate.
+- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings` — **expect clean**.
 - [ ] Format and commit: `cargo fmt --all` then
       `git commit -m "tui: report a stored key as unverified rather than saved"`.
 
@@ -146,7 +155,9 @@ retires `status.key_set`.
       runtime drops the task unpolled at the end of the test; (b) `handle_key_probed` is called
       directly with synthetic `FetchError` values and touches no runtime at all. Neither path calls
       `resolve_key`, so an exported `OPENAI_API_KEY` cannot change any assertion.
-  - `submitting_a_key_starts_a_probe` — `#[tokio::test]`, no await. After
+  - `submitting_a_key_starts_a_probe` — `#[tokio::test]`, no await. (Spec §9.2 names this
+    `submitting_a_key_stores_it_and_starts_a_probe`; the `store.get` half of it is already asserted
+    by Task 1's test, so it is not repeated here. No assertion is dropped.) After
     `app.submit_key_entry()` with `key_target = Some("openai")`: `app.key_probe_nonce != 0` and
     `app.key_probe.is_some()`.
   - `a_failed_keyring_write_starts_no_probe` — `#[tokio::test]`, no await,
@@ -172,19 +183,24 @@ retires `status.key_set`.
     in `app.key_probe`, call `app.next_key_probe_nonce()` **directly** (not `submit_key_entry` — that
     would spawn a real network probe that `settle()`'s yields would then poll), `settle(&probe).await`,
     and assert `probe.is_finished()` and that the returned nonce is greater than the one before.
-- [ ] Run `cargo test -p light-factory-tui key_prob probe` — **expect compile failure** (the fields,
+- [ ] Run `cargo test -p light-factory-tui probe` — **expect compile failure** (the fields,
       the variant, and the three methods do not exist). Compile failure is the failing state for
       this task.
 - [ ] Add the three EN/ES catalog entries to `crates/tui/src/i18n.rs`, both tables, adjacent to
       `status.key_stored_unverified`:
       `("status.key_verified", "{provider} accepted the API key")` /
-      `("status.key_verified", "{provider} acept\u{f3} la clave de API")`;
+      `("status.key_verified", "{provider} aceptó la clave de API")`;
       `("status.key_rejected", "{provider} rejected the API key \u{2014} it is still stored")` /
-      `("status.key_rejected", "{provider} rechaz\u{f3} la clave de API \u{2014} sigue guardada")`;
-      `("status.key_unverified", "Couldn't reach {provider} to verify the API key \u{2014} it is stored")` /
-      `("status.key_unverified", "No se pudo contactar con {provider} para verificar la clave de API \u{2014} est\u{e1} guardada")`.
-      Match the file's existing convention for accented ES characters (literal vs escape) — check the
-      neighbouring ES entries and follow them.
+      `("status.key_rejected", "{provider} rechazó la clave de API \u{2014} sigue guardada")`;
+      `("status.key_unreachable", "Couldn't reach {provider} to verify the API key \u{2014} it is stored")` /
+      `("status.key_unreachable", "No se pudo contactar con {provider} \u{2014} la clave sigue guardada")`
+      — deliberately shorter than a literal translation of the EN string. The status renders as a
+      single unwrapped `Paragraph` in the title row behind a 17-column `" light-factory · "` prefix
+      (`app.rs:1383`), so a literal translation would total 95 columns with `{provider}` = `openai`
+      and lose its trailing reassurance on an 80-column terminal. This is the same failure
+      `every_footer_fits_the_popup_in_both_locales` exists to prevent, on a key that test does not
+      cover.
+      Same convention as Task 1: `\u{2014}` for the em dash, literal accented letters for Spanish.
 - [ ] In `crates/tui/src/app.rs`, add the `KeyProbed` variant to `pub enum UiEvent`, after
       `ModelsFetched`:
       ```rust
