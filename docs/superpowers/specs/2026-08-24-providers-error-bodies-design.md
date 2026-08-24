@@ -146,10 +146,15 @@ put the user's live API key into a terminal cell and into scrollback. Redaction 
 replace over the normalized text, performed **before** the length cap so a truncation cannot leave a
 usable key prefix, and **after** control-character stripping so a key with interleaved control
 characters cannot evade the match. Empty keys are skipped (replacing the empty string would be a
-runaway).
+runaway). The match is an exact substring, so it catches a verbatim echo (including inside a
+`Bearer <key>` fragment) but not a percent-encoded, case-folded, or partially-masked one — a masked
+echo is not a usable credential, so that residue is accepted rather than chased with fuzzy matching
+that would mangle honest text.
 
 **A6. The captured detail is framed as the provider's, not as this tool's.** The context string is
-`the provider returned HTTP {status}: {detail}` (or `... : no error detail in the response body`).
+`the provider returned HTTP {status}: {detail}`, or — when no detail could be captured — exactly
+`the provider returned HTTP {status} with no error detail`. Those two are the canonical strings;
+§5.2 is their definition and everything else quotes it.
 The status is repeated in the context — even though `reqwest::Error`'s own Display carries it —
 because the TUI shows only the first 120 characters of `format!("{err:#}")`, and the context comes
 first; without the status in the context, a long provider message would push the status off the
@@ -243,7 +248,11 @@ async fn error_detail(
 - **Order is deliberate:** strip control characters first (so an interleaved-control-character key
   is matched), redact second, cap last (so truncation cannot bisect a key and leave a usable
   prefix).
-- `DETAIL_MAX_CHARS = 200`, above the TUI's 120-char display cap by design (A2).
+- `DETAIL_MAX_CHARS = 200`, above the TUI's 120-char display cap by design (A2). **Contract:** at
+  most `DETAIL_MAX_CHARS` characters *of provider text*, plus a single U+2026 marker when
+  truncation happened — so the rendered detail is at most 201 characters and a truncated message
+  never looks like a complete one. This mirrors `summarize_provider_error`'s existing 120-then-append
+  behaviour rather than inventing a second convention.
 
 `extract_error_message` deserializes with `serde_json` into:
 
@@ -264,8 +273,9 @@ precede the bare string. A parse failure returns `None` and A4's raw-text fallba
 
 ### 5.4 Threading the secret
 
-`parse_capped` gains a `secret: Option<&str>` parameter, forwarded to `check_status`. The five call
-sites pass:
+`parse_capped` gains a `secret: Option<&str>` parameter, forwarded to `check_status`. Its **four**
+call sites — serving five providers, since `list_openai_compatible` backs both OpenAI and DeepSeek —
+pass:
 
 | Call site | `secret` |
 |---|---|
@@ -353,10 +363,10 @@ A user whose Gemini key is rejected sees the provider's own sentence instead of 
    an error whose `{:#}` rendering contains both `400` and `API key not valid`.
 2. The `reqwest::Error` with its HTTP status remains reachable via `anyhow::Error::chain()` for every
    non-2xx, pinned by a test in `crates/providers`.
-3. No captured error text can exceed `DETAIL_MAX_CHARS` characters, span more than one line, or
-   contain a control character.
+3. No captured error text can carry more than `DETAIL_MAX_CHARS` characters of provider text (plus
+   the single U+2026 truncation marker), span more than one line, or contain a control character.
 4. No response body over `max_error_bytes` is buffered on any path, credentialed or not.
-5. A key echoed back by an endpoint never appears in the error.
+5. A key echoed back **verbatim** by an endpoint never appears in the error.
 6. `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and
    `cargo fmt --all --check` are clean, with zero lines changed under `crates/tui`.
 
@@ -368,6 +378,17 @@ credentials step. What changes is that the modal now *says* "API key not valid. 
 API key.", so the path is no longer silent — which is the outcome the issue calls the real fix.
 Closing it fully needs the `crates/tui` half (A1). **Follow-up to file:** "tui: reclassify a 400
 whose error body matches an auth signature as `FetchFailure::Auth`".
+
+**Issue hygiene, load-bearing:** because the issue's title AC ("...classifies as auth") is *not* met,
+the PR must reference #59 **without** a closing keyword, and the follow-up must be filed before
+merge. Otherwise the recorded gap evaporates with the issue.
+
+**Verification gap:** criterion 1 pins the untruncated `{:#}` rendering inside `crates/providers`.
+What a user actually sees is that string after `crates/tui`'s 120-character
+`summarize_provider_error` cap, which no test in this crate can cover. The budget works today —
+`the provider returned HTTP 400: ` is 31 characters and Gemini's message is 47, so 78 of 120 — but
+that is reasoning, not a pin. A future lengthening of the context prefix could push the provider's
+sentence off the rendered line with every test still green.
 
 **R2. The completion paths still discard their error bodies.** `anthropic.rs:102`,
 `gemini.rs:127`, `ollama.rs:69`, and `openai_compatible.rs:70` all end in `error_for_status()?`.
