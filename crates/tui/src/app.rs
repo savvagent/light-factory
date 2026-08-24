@@ -786,7 +786,8 @@ impl App {
     fn enter_models(&mut self) {
         let provider = self.provider_info.id.clone();
         if self.provider_info.offline.is_some() {
-            self.open_modal(Modal::Models(ModelsStep::Offline), None);
+            let step = self.offline_models_step();
+            self.open_modal(Modal::Models(step), None);
             return;
         }
         self.open_modal(
@@ -798,6 +799,26 @@ impl App {
             }),
             None,
         );
+    }
+
+    /// The step `/models` opens when no live provider is active.
+    ///
+    /// A store failure recorded by the last `rebuild` is *why* there is no key, so the plain
+    /// offline step — "use /connect first" — would send the user into a flow that writes to the
+    /// same unreadable store. Report the store instead, on the step that carries a remedy and a
+    /// Ctrl+R that re-reads it.
+    fn offline_models_step(&self) -> ModelsStep {
+        let Some(failure) = self.provider_info.store_failures.first() else {
+            return ModelsStep::Offline;
+        };
+        ModelsStep::Credentials {
+            error: self.t_with(
+                "provider.store.unavailable",
+                &[("provider", &failure.provider), ("error", &failure.error)],
+            ),
+            class: FetchFailure::StoreUnavailable,
+            provider: failure.provider.clone(),
+        }
     }
 
     fn handle_models_fetched(
@@ -3664,6 +3685,37 @@ mod tests {
         app.run_command("/models").await;
         assert_eq!(models_step(&app), Some(&ModelsStep::Offline));
         assert!(app.settings.models.is_empty());
+    }
+
+    /// The headline case from #51: the keyring is already locked when the TUI starts, so
+    /// `rebuild` records the failures, no key resolves, and the provider is offline before
+    /// `/models` is ever opened. The offline step would send the user to `/connect`, which writes
+    /// to the same unreadable store.
+    #[test]
+    fn models_reports_the_store_when_the_offline_fallback_was_its_fault() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.provider_info.store_failures = vec![crate::provider::StoreFailure {
+            provider: "openai".to_string(),
+            error: "no D-Bus session".to_string(),
+        }];
+        app.enter_models();
+        let Some(ModelsStep::Credentials { error, .. }) = models_step(&app) else {
+            panic!("expected the credentials step, got {:?}", models_step(&app));
+        };
+        assert!(
+            error.contains("openai") && error.contains("no D-Bus session"),
+            "{error}"
+        );
+    }
+
+    /// Offline for a reason that is not the store still gets the plain offline step.
+    #[test]
+    fn models_still_reports_offline_when_no_store_failed() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.enter_models();
+        assert!(matches!(models_step(&app), Some(ModelsStep::Offline)));
     }
 
     #[test]
