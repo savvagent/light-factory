@@ -207,7 +207,7 @@ async fn check_status(
     bounds: ListBounds,
     secret: Option<&str>,
 ) -> anyhow::Result<reqwest::Response> {
-    let Err(status_err) = raw.error_for_status_ref() else {
+    let Some(status_err) = raw.error_for_status_ref().err() else {
         return Ok(raw);
     };
     let status = status_err.status().map(|s| s.as_u16());
@@ -239,10 +239,14 @@ async fn error_detail(
 ) -> Option<String> {
     let body = read_capped(resp, bounds.max_error_bytes).await.ok()?;
     let text = String::from_utf8_lossy(&body);
-    let message = extract_error_message(&text).unwrap_or_else(|| text.to_string());
-    let normalized = sanitize_detail(&message);      // first line, control-free, trimmed
-    let redacted = redact_secret(normalized, secret); // before the cap (A5)
-    let capped = cap_chars(redacted, DETAIL_MAX_CHARS);
+    // Sequenced through a `let` rather than `unwrap_or_else`: the closure would capture `text` by
+    // move while `extract_error_message(&text)` still borrows it.
+    let extracted = extract_error_message(&text);
+    let message = extracted.unwrap_or_else(|| text.into_owned());
+    let capped = cap_chars(
+        redact_secret(normalize_detail(&message), secret),  // normalize, then redact, then cap (A5)
+        DETAIL_MAX_CHARS,
+    );
     (!capped.is_empty()).then_some(capped)
 }
 ```
@@ -320,7 +324,11 @@ All offline, against `wiremock`, next to the code in `crates/providers/src/model
    401 response; `err.chain().find_map(downcast_ref::<reqwest::Error>()).and_then(status)` is
    `Some(401)`. Mirrors the walk `crates/tui/src/modal.rs` performs, so removing the `reqwest::Error`
    source fails here rather than silently in the TUI.
-3. `an_openai_error_envelope_is_extracted` — `{"error":{"message":...,"type":...}}` on a 401.
+3. `an_anthropic_error_envelope_is_extracted_despite_its_outer_type_field` — Anthropic's envelope
+   carries a sibling top-level `type`, so this pins that unknown fields are ignored rather than
+   dropping the parse into the raw-text fallback. The OpenAI/DeepSeek `error.message` shape is
+   asserted inside test 2 rather than in a test of its own, so all four provider shapes are covered
+   across tests 1-4 without a fifth near-duplicate.
 4. `an_ollama_string_error_envelope_is_extracted` — `{"error":"..."}` on a 404 via
    `list_ollama_models_at`.
 5. `a_non_json_error_body_falls_back_to_its_first_line` — an HTML/`text/plain` 502.
@@ -350,7 +358,7 @@ stays green: no classification rule changes.
 
 - `ListBounds` is `pub(crate)`; the new field is invisible outside the crate.
 - `parse_capped`, `read_capped`, `check_status`, `error_detail`, `extract_error_message`,
-  `sanitize_detail`, `redact_secret`, `cap_chars`, `ErrorEnvelope`, `ErrorPayload` are all private.
+  `normalize_detail`, `redact_secret`, `cap_chars`, `ErrorEnvelope`, `ErrorPayload` are all private.
 - `list_models`, `list_ollama_models`, `list_models_at`, `list_ollama_models_at` keep their exact
   signatures.
 - The only observable change to a consumer is the **text** of an `anyhow::Error` on a path that
@@ -391,9 +399,10 @@ merge. Otherwise the recorded gap evaporates with the issue.
 
 **Verification gap:** criterion 1 pins the untruncated `{:#}` rendering inside `crates/providers`.
 What a user actually sees is that string after `crates/tui`'s 120-character
-`summarize_provider_error` cap, which no test in this crate can cover. The budget works today —
-`the provider returned HTTP 400: ` is 31 characters and Gemini's message is 47, so 78 of 120 — but
-that is reasoning, not a pin. A future lengthening of the context prefix could push the provider's
+`summarize_provider_error` cap, which no test in this crate can cover. The budget was **measured** on the shipped
+strings: the context prefix `the provider returned HTTP 400: ` is 32 characters and Gemini's message
+is 47, so the diagnosis ends at character 79 of 120 — 41 characters of headroom, and the user sees
+the sentence in full. But that is a measurement, not a pin. A future lengthening of the context prefix could push the provider's
 sentence off the rendered line with every test still green.
 
 **R2. The completion paths still discard their error bodies.** `anthropic.rs:102`,
