@@ -208,6 +208,15 @@ const EN: Catalog = &[
         "status.key_stored_unverified",
         "API key stored for {provider} \u{2014} not yet verified",
     ),
+    ("status.key_verified", "{provider} accepted the API key"),
+    (
+        "status.key_rejected",
+        "{provider} rejected the API key \u{2014} it is still stored",
+    ),
+    (
+        "status.key_unreachable",
+        "Couldn't reach {provider} to verify the API key \u{2014} it is stored",
+    ),
     ("status.key_cleared", "API key cleared for {provider}"),
     (
         "status.key_failed",
@@ -519,6 +528,15 @@ const ES: Catalog = &[
     (
         "status.key_stored_unverified",
         "Clave de API guardada para {provider} \u{2014} aún sin verificar",
+    ),
+    ("status.key_verified", "{provider} aceptó la clave de API"),
+    (
+        "status.key_rejected",
+        "{provider} rechazó la clave de API \u{2014} sigue guardada",
+    ),
+    (
+        "status.key_unreachable",
+        "No se pudo contactar con {provider} para verificar la clave de API \u{2014} está guardada",
     ),
     (
         "status.key_cleared",

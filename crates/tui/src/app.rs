@@ -64,6 +64,13 @@ pub enum UiEvent {
         provider: String,
         result: Result<Vec<String>, FetchError>,
     },
+    /// The verification probe for a key `/key` has just stored. Carries no model list: `/key` has
+    /// no renderer for one, and not carrying it keeps a provider-supplied payload off this path.
+    KeyProbed {
+        nonce: u64,
+        provider: String,
+        result: Result<(), FetchError>,
+    },
 }
 
 /// Which field currently owns keyboard input.
@@ -116,6 +123,17 @@ pub struct App {
     key_target: Option<String>,
     key_input: String,
     key_return: Mode,
+    /// Generation of the most recent `/key` verification probe. A second `/key` submitted while the
+    /// first probe is still in flight bumps this, so the older result — which answers a question
+    /// the user has already replaced — fails the check in [`App::handle_key_probed`] and is
+    /// discarded rather than overwriting a newer status. Starts at 0 and is incremented *before*
+    /// use, so no live probe ever carries nonce 0.
+    key_probe_nonce: u64,
+    /// The in-flight `/key` verification probe, if any. Held so [`App::next_key_probe_nonce`] can
+    /// abort it: the request carries an API key in its headers, and two probes in flight is two
+    /// keys in flight. Deliberately not inside [`ModalHost`] — `/key` is `Mode::Key`, a screen, and
+    /// the modal host's nonce exists to discard results that outlive their *modal*.
+    key_probe: Option<tokio::task::JoinHandle<()>>,
     /// The one overlay that owns the keyboard, if any, together with its fetch generation and
     /// cancellation handle. One field, not six: "two modals open at once" is unrepresentable.
     modal: ModalHost,
@@ -169,6 +187,8 @@ impl App {
             settings: settings.settings,
             settings_path: settings.path,
             key_target: None,
+            key_probe_nonce: 0,
+            key_probe: None,
             key_input: String::new(),
             key_return: Mode::SignIn,
             modal: ModalHost::default(),
@@ -479,8 +499,14 @@ impl App {
         match self.store.set(&provider, &key) {
             Ok(()) => {
                 self.rebuild_provider();
+                // The floor, set unconditionally and before the probe exists: if nothing ever
+                // comes back — the process dies, the next `/key` aborts this one, the fetch hangs
+                // to its deadline — "not yet verified" is still exactly true. The probe below only
+                // ever replaces this with a sharper sentence, so the honesty of the status never
+                // depends on a network round-trip landing (#61).
                 self.status =
                     self.t_with("status.key_stored_unverified", &[("provider", &provider)]);
+                self.begin_key_probe(provider, key);
             }
             Err(e) => {
                 let error = e.to_string();
@@ -490,6 +516,78 @@ impl App {
                 ));
             }
         }
+    }
+
+    /// Claim the next `/key` probe generation, cancelling and invalidating whatever probe was in
+    /// flight.
+    ///
+    /// Bumping and aborting are one operation for the reason [`ModalHost::next_fetch_nonce`] gives:
+    /// they are the same event, so no call site can perform one and forget the other — and
+    /// forgetting the abort would leave a request carrying the previous API key in its headers
+    /// running against an answer nobody will read.
+    ///
+    /// `wrapping_add` because a `u64` count of `/key` submissions cannot realistically wrap, and a
+    /// panic there would be a worse outcome than a reused generation.
+    fn next_key_probe_nonce(&mut self) -> u64 {
+        self.key_probe_nonce = self.key_probe_nonce.wrapping_add(1);
+        if let Some(previous) = self.key_probe.take() {
+            previous.abort();
+        }
+        self.key_probe_nonce
+    }
+
+    /// Ask the provider whether the key just stored is one it accepts, off the UI loop.
+    ///
+    /// The probe is a model-list fetch because that is what the codebase has, what `/connect`
+    /// already runs after its own key entry, and what #55 already classifies into
+    /// [`FetchFailure`] — so `/key` and `/connect` now agree about whether they checked.
+    ///
+    /// `Some(key)` is load-bearing, never `None`: `None` would let `fetch_model_list` call
+    /// `resolve_key`, which prefers an exported `OPENAI_API_KEY` over the keyring, and the user
+    /// would be told the key they just typed was accepted on the strength of a different
+    /// credential entirely.
+    ///
+    /// The model list is discarded at the boundary — `/key` has no use for it.
+    fn begin_key_probe(&mut self, provider: String, key: String) {
+        let nonce = self.next_key_probe_nonce();
+        let events = self.events.clone();
+        let store = self.store.clone();
+        let lang = self.config.lang;
+        self.key_probe = Some(tokio::spawn(async move {
+            let result = fetch_model_list(&provider, Some(key), store.as_ref(), lang)
+                .await
+                .map(|_| ());
+            let _ = events.send(UiEvent::KeyProbed {
+                nonce,
+                provider,
+                result,
+            });
+        }));
+    }
+
+    /// Replace the stored-unverified status with what the probe actually learned.
+    ///
+    /// The key is never un-stored, on any outcome: a 401 can come from an auth-edge outage, an IP
+    /// allowlist, or an org-level block as easily as from a bad credential, and `/key <provider>
+    /// clear` is the user's to run. The status carries the news; the store carries their intent.
+    ///
+    /// [`FetchError::message`] is deliberately not interpolated. It is provider-supplied text on a
+    /// path whose whole subject is a live credential, so every `/key` status takes `{provider}` and
+    /// nothing else.
+    fn handle_key_probed(&mut self, nonce: u64, provider: String, result: Result<(), FetchError>) {
+        if nonce != self.key_probe_nonce {
+            return;
+        }
+        // The nonce matched, so this is the current probe's own result and that task is done.
+        self.key_probe = None;
+        let status = match &result {
+            Ok(()) => "status.key_verified",
+            // The one predicate #55 draws: a credential failure, versus anything that says nothing
+            // about the key.
+            Err(e) if e.class.needs_credentials() => "status.key_rejected",
+            Err(_) => "status.key_unreachable",
+        };
+        self.status = self.t_with(status, &[("provider", &provider)]);
     }
 
     /// Tear down any open modal, and cancel and invalidate its in-flight fetch.
@@ -1808,6 +1906,11 @@ pub async fn run(
                         provider,
                         result,
                     } => app.handle_models_fetched(nonce, provider, result),
+                    UiEvent::KeyProbed {
+                        nonce,
+                        provider,
+                        result,
+                    } => app.handle_key_probed(nonce, provider, result),
                 }
             }
             _ = tick.tick() => {
@@ -3669,6 +3772,171 @@ mod tests {
             app.store.get("openai").unwrap().as_deref(),
             Some("sk-test-key"),
             "the key must still be written to the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn submitting_a_key_starts_a_probe() {
+        let mut app = test_app();
+        app.key_target = Some("openai".to_string());
+        app.key_input = "sk-test-key".to_string();
+
+        app.submit_key_entry();
+
+        assert_ne!(
+            app.key_probe_nonce, 0,
+            "the probe generation must be bumped"
+        );
+        assert!(app.key_probe.is_some(), "the probe must be tracked");
+    }
+
+    /// Nothing was stored, so there is nothing to verify — and a probe here would send the key the
+    /// keyring just refused to hold.
+    #[tokio::test]
+    async fn a_failed_keyring_write_starts_no_probe() {
+        let mut app = test_app_with_store(Arc::new(FailingStore));
+        app.key_target = Some("openai".to_string());
+        app.key_input = "sk-test-key".to_string();
+
+        app.submit_key_entry();
+
+        assert!(app.error.is_some(), "the failure must be surfaced");
+        assert!(app.key_probe.is_none());
+        assert_eq!(app.key_probe_nonce, 0);
+    }
+
+    #[test]
+    fn an_accepted_key_reports_verification() {
+        let mut app = test_app();
+        app.key_probe_nonce = 7;
+
+        app.handle_key_probed(7, "openai".to_string(), Ok(()));
+
+        assert_eq!(app.status, "openai accepted the API key");
+        assert!(app.key_probe.is_none());
+    }
+
+    /// A rejected key is still the key the user asked us to hold: a 401 can come from an auth-edge
+    /// outage as easily as from a bad credential, so the status carries the news and the store
+    /// keeps the user's intent (#61).
+    #[test]
+    fn a_rejected_key_reports_rejection_and_stays_stored() {
+        let store = Arc::new(MemStore::new());
+        store.set("openai", "sk-test-key").unwrap();
+        let mut app = test_app_with_store(store);
+        app.key_probe_nonce = 7;
+
+        app.handle_key_probed(
+            7,
+            "openai".to_string(),
+            Err(FetchError {
+                class: FetchFailure::Auth,
+                message: "openai: 401".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            app.status,
+            "openai rejected the API key \u{2014} it is still stored"
+        );
+        assert_eq!(
+            app.store.get("openai").unwrap().as_deref(),
+            Some("sk-test-key"),
+            "a rejected key must not be un-stored"
+        );
+    }
+
+    /// Pins the shared arm: both credential classes route through `needs_credentials()`, so a probe
+    /// that reports `MissingKey` cannot silently fall through to the retryable wording.
+    #[test]
+    fn a_missing_key_class_reports_rejection() {
+        let mut app = test_app();
+        app.key_probe_nonce = 7;
+
+        app.handle_key_probed(
+            7,
+            "openai".to_string(),
+            Err(FetchError {
+                class: FetchFailure::MissingKey,
+                message: "no key".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            app.status,
+            "openai rejected the API key \u{2014} it is still stored"
+        );
+    }
+
+    /// A timeout, a DNS failure, or a 5xx says nothing about the key, so the status must not accuse
+    /// it — and must stay distinct from the rejection wording.
+    #[test]
+    fn an_unreachable_provider_does_not_accuse_the_key() {
+        let store = Arc::new(MemStore::new());
+        store.set("openai", "sk-test-key").unwrap();
+        let mut app = test_app_with_store(store);
+        app.key_probe_nonce = 7;
+
+        app.handle_key_probed(
+            7,
+            "openai".to_string(),
+            Err(FetchError {
+                class: FetchFailure::Fetch,
+                message: "connection refused".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            app.status,
+            "Couldn't reach openai to verify the API key \u{2014} it is stored"
+        );
+        assert_ne!(
+            app.status,
+            "openai rejected the API key \u{2014} it is still stored"
+        );
+        assert_eq!(
+            app.store.get("openai").unwrap().as_deref(),
+            Some("sk-test-key")
+        );
+    }
+
+    /// A second `/key` while the first probe is in flight must win: the older result answers a
+    /// question the user has already replaced.
+    #[test]
+    fn a_stale_probe_result_is_discarded() {
+        let mut app = test_app();
+        app.key_probe_nonce = 7;
+        app.status = "sentinel".to_string();
+
+        app.handle_key_probed(6, "openai".to_string(), Ok(()));
+
+        assert_eq!(app.status, "sentinel");
+    }
+
+    /// The abort lives inside the nonce claim so no call site can bump the generation and forget to
+    /// cancel — the request carries an API key in its headers, and two probes in flight is two keys
+    /// in flight.
+    ///
+    /// Drives `next_key_probe_nonce` directly rather than `submit_key_entry`: `settle` awaits, which
+    /// would drive the run queue and poll a real probe task all the way to a live request. Claiming
+    /// a nonce spawns nothing.
+    #[tokio::test]
+    async fn claiming_a_probe_nonce_aborts_the_previous_probe() {
+        let mut app = test_app();
+        let (handle, probe) = pending_task();
+        app.key_probe = Some(handle);
+
+        let nonce = app.next_key_probe_nonce();
+
+        settle(&probe).await;
+        assert!(
+            probe.is_finished(),
+            "a replaced probe must not be left running with the previous key"
+        );
+        assert_ne!(nonce, 0);
+        assert!(
+            app.key_probe.is_none(),
+            "the aborted handle must be dropped"
         );
     }
 
