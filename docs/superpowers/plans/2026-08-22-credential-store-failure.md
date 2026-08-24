@@ -2589,3 +2589,250 @@ pub fn build_selection(
       — all three must pass, the third being the one that fails today. Then `cargo test --workspace`,
       clippy, `cargo fmt --all`. Commit as
       `tui: pin the store-failure state mappings and drop the tests' environment dependence`.
+
+---
+
+# Round 3 — findings from the round-2 re-review
+
+Three reviewers (silent-failure, architect, blind-diff security) converged independently on the same
+three blocking defects. One of them was demonstrated empirically with a real ratatui render, not
+argued from reading — that is the one to take most seriously, because round 2 *believed* it had
+fixed it.
+
+### Task 12: Fix the three defects round 2 introduced or failed to close
+
+**Files:** `crates/tui/src/i18n.rs`, `crates/tui/src/provider.rs`, `crates/tui/src/app.rs`.
+
+#### 12A — The remedy round 2 added is invisible. `draw_engine` clips; it does not wrap.
+
+Round 2 appended "Unlock it and restart, or set ANTHROPIC_API_KEY …" to
+`provider.offline.store_unavailable`, taking it to 206 characters (EN) / 228 (ES), with the remedy
+starting at offset 111 / 131. Its only consumer is `engine_log`, rendered as `ListItem::new(String)`
+in a ratatui `List`, which **truncates** — a fact `selection.rs`'s own comment already asserts. A
+reviewer rendered it at 80 columns and got the sentence cut mid-clause, with no ellipsis, and
+`contains("ANTHROPIC_API_KEY") == false`.
+
+So the round-1 finding is not fixed; it is re-created one clause later. And
+`the_store_offline_notice_still_names_a_remedy` passes because it asserts on the **string**, not on
+the render — the same mistake in the test as in the fix.
+
+- [ ] Split the remedy into its own catalog entry and push it as its own line, so the list gives it a
+      row. Keep every new line under ~58 characters in **both** locales, the width the popup gate
+      already treats as the safe budget.
+
+```rust
+        if let Some(reason) = &self.offline {
+            let store_caused = /* unchanged */;
+            if store_caused {
+                lines.push(i18n::t(locale, "provider.offline.store_unavailable").to_string());
+                lines.push(i18n::t(locale, "provider.offline.store_remedy").to_string());
+            } else {
+                lines.push(offline_notice(locale, reason));
+            }
+        }
+```
+
+      EN: `provider.offline.store_unavailable` → `"Offline: the credential store could not be read."`;
+      `provider.offline.store_remedy` → `"Unlock it and restart, or set a provider's API key in the environment."`
+      ES: `"Sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales."` and
+      `"Desbloqu\u{e9}alo y reinicia, o define la clave de API de un proveedor en el entorno."`
+
+- [ ] **Assert on the render, not the string.** Add a test that drives `draw_engine` through a
+      `TestBackend::new(80, 12)` and asserts the remedy text is actually present in the buffer.
+      Without it this regresses the moment someone lengthens a line. Follow the existing
+      `draw_to_text` helper's shape.
+
+- [ ] **Guard the whole catalog, not just this key.** The existing
+      `every_footer_fits_the_popup_in_both_locales` gates `*.footer` only. Add a sibling gating every
+      `provider.offline.*` and `provider.store.*` key at 58 columns in both locales, with a comment
+      naming `draw_engine`'s `List` as the reason.
+
+#### 12B — `offline_models_step` asserts the store is the cause when it may not be, and names a provider the user never chose
+
+Two defects in one function, flagged by all three reviewers.
+
+*It never reads `offline`.* Ten lines away, `ProviderInfo::notices` was hardened in round 2 to branch
+exhaustively on `OfflineReason` precisely so it would not overwrite another cause — and
+`offline_models_step` does exactly that overwrite. With a rejected `*_BASE_URL` **and** a locked
+keyring, `/models` tells the user to unlock the credential store, which cannot help.
+
+*It takes `store_failures.first()`.* In the headline scenario all four `REMOTE_IDS` fail, so `first()`
+is always `anthropic`. A user on DeepSeek reads a sentence about Anthropic, and Ctrl+R retries
+Anthropic. The existing test plants a **single** `openai` failure, so it never sees this.
+
+- [ ] Put the predicate on `ProviderInfo`, where both fields live, and drive both consumers from it:
+
+```rust
+    /// The store failures, but only when the store is why there is no key.
+    ///
+    /// `notices` and `/models` both have to answer this, and answering it twice is how they drifted
+    /// apart: one branched exhaustively on the reason, the other ignored it entirely.
+    pub fn store_caused_offline(&self) -> &[StoreFailure] {
+        match self.offline {
+            Some(OfflineReason::NothingConfigured) => &self.store_failures,
+            Some(OfflineReason::NamedProviderMissingKey { .. } | OfflineReason::BaseUrlRejected { .. })
+            | None => &[],
+        }
+    }
+```
+
+- [ ] `offline_models_step` uses it, and names the provider the user is actually trying to reach
+      (`self.provider_info.id`) rather than `REMOTE_IDS[0]`, collapsing the message the same way
+      `notices` does when every cause matches.
+- [ ] Add the test the existing one is missing: plant a failure for **all four** `REMOTE_IDS` and
+      assert the step does not name a provider the user never chose.
+- [ ] Add a test that a non-`NothingConfigured` offline reason plus a store failure yields
+      `ModelsStep::Offline`, not the store step.
+
+#### 12C — A lone store failure is reported as a whole-store failure, and an assertion was weakened to allow it
+
+`split_first()` on a one-element vec leaves `rest` empty, so `rest.iter().all(..)` is vacuously true
+and a **single** failure takes the collapsed "Could not read the credential store" branch, dropping
+the provider name. `KeyringStore` reads per entry, so exactly one provider's item failing is a real
+state — and it is the case where naming the provider matters most.
+
+Round 2 weakened `a_store_failure_replaces_the_nothing_configured_notice` from
+`n.contains("openai") && n.contains("locked")` to `n.contains("locked")` to accommodate this. A test
+relaxed to fit an implementation is the smell; three reviewers named it independently.
+
+- [ ] Match on the slice so the lone case is explicit, and restore the original assertion:
+
+```rust
+        match self.store_failures.as_slice() {
+            [] => {}
+            [only] => lines.push(i18n::t_with(
+                locale,
+                "provider.store.unavailable",
+                &[("provider", &only.provider), ("error", &only.error)],
+            )),
+            [first, rest @ ..] if rest.iter().all(|f| f.error == first.error) => lines.push(
+                i18n::t_with(locale, "provider.store.unavailable_all", &[("error", &first.error)]),
+            ),
+            all => {
+                for failure in all {
+                    lines.push(i18n::t_with(
+                        locale,
+                        "provider.store.unavailable",
+                        &[("provider", &failure.provider), ("error", &failure.error)],
+                    ));
+                }
+            }
+        }
+```
+
+- [ ] Run all three environment variants, clippy, fmt. Commit as
+      `tui: report the real cause and the real provider when the store fails`.
+
+---
+
+### Task 13: Close the text-hygiene gaps
+
+**Files:** `crates/tui/src/text.rs`, `crates/tui/src/selection.rs`, `crates/tui/src/app.rs`.
+
+- [ ] **Test the general category, not an enumerated range list.** The round-2 predicate misses
+      U+061C (ARABIC LETTER MARK — a UAX #9 bidi control in the same family as LRM/RLM), the
+      `U+206A..206F` format controls, and the **Unicode tag block `U+E0000..E007F`**, which encodes
+      arbitrary ASCII in zero visible columns. That last one matters here specifically: this text
+      lands in a scrollback the user is invited to copy and paste, in an application whose purpose is
+      piping text to an LLM. Enumerating ranges loses this race one block at a time.
+
+      Keep the function name and doc, and widen the predicate to cover the Cf general category plus
+      the line/paragraph separators `U+2028`/`U+2029` (which `str::lines` does not split on, so they
+      survive `one_line` into a cell). If pulling in a `unicode-general-category` dependency is not
+      warranted for one predicate, enumerate the Cf blocks exhaustively and say in the doc that the
+      list is the Cf category as of Unicode 16, so the next reader knows the maintenance rule.
+      Extend the existing test to cover U+061C, U+E0001, U+2028, and U+00AD.
+
+- [ ] **Cap the `set`/`delete` errors too.** Round 2 gave three write paths `one_line` but not
+      `truncate_chars`, while `read_store` caps `get`. Same untrusted source, same rendering surface.
+      Add a `pub(crate) fn store_error(e: &anyhow::Error) -> String` next to `read_store` that does
+      `truncate_chars(&one_line(&format!("{e:#}")), STORE_ERROR_MAX_CHARS)`, and route all four seams
+      through it — one helper, no seam left out.
+
+- [ ] **Guard the empty case.** Nothing checks whether the reduced text is empty, and round 2 widened
+      the set of inputs that can reduce to nothing. The user then reads "Could not read the credential
+      store: " with a dangling colon and nothing to paste into a bug report. Inside `store_error`,
+      fall back to a sentinel that says the cause was unprintable rather than rendering emptiness.
+
+- [ ] **`/models`' offline path must log.** `handle_models_fetched` calls `push_log` with the stated
+      rationale that "the modal is not a record: Esc would erase the only copy of the failure."
+      `offline_models_step`, added in round 2, does not. A user who opens `/models`, reads the store
+      error, and presses Esc is left with it on no surface at all. Have `enter_models` push the
+      composed error to the log when it routes to the store step.
+
+- [ ] Three environment variants, clippy, fmt. Commit as
+      `tui: bound and record every store error the user can be shown`.
+
+---
+
+### Task 14: Stop `/connect` telling the user to run `/connect`
+
+**Files:** `crates/tui/src/modal.rs`.
+
+`connect_view` renders `failure.and_then(FetchFailure::remedy_key)` for **every** credential class.
+For `Auth` and `MissingKey` that key is `models.credentials_remedy` — *"Use /connect, /key {provider},
+or /model <id>"* — rendered to a user standing inside the `/connect` modal, pointing at `/connect`,
+and naming a manual-entry step `ConnectStep` does not have. Task 9's motivation was the store class;
+the implementation generalized past it, and no test covers `Auth` or `MissingKey` through
+`connect_view`, which is why the wording slipped.
+
+The remedy is not a function of the class alone — it depends on where the user is standing.
+
+- [ ] Make that second dimension explicit rather than implicit:
+
+```rust
+/// Where a remedy is being rendered. The right advice depends on it: `/connect` must not tell a user
+/// already inside `/connect` to run `/connect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    Models,
+    Connect,
+}
+
+impl FetchFailure {
+    pub(crate) fn remedy_key(self, surface: Surface) -> Option<&'static str> {
+        match (self, surface) {
+            (FetchFailure::StoreUnavailable, _) => Some("models.store_remedy"),
+            (FetchFailure::MissingKey | FetchFailure::Auth, Surface::Models) => {
+                Some("models.credentials_remedy")
+            }
+            // Inside `/connect` the user is already on the remedy; the key field is one Esc away.
+            (FetchFailure::MissingKey | FetchFailure::Auth, Surface::Connect) => None,
+            (FetchFailure::Fetch, _) => None,
+        }
+    }
+}
+```
+
+      `needs_credentials` becomes `self.remedy_key(Surface::Models).is_some()`, which preserves its
+      current meaning exactly — it is a routing question about the models modal.
+
+- [ ] Add the tests whose absence let this through: `Auth` and `MissingKey` rendered through
+      `connect_view` offer no remedy row, while `StoreUnavailable` does.
+- [ ] Three environment variants, clippy, fmt. Commit as
+      `tui: make the credential remedy depend on the surface it is shown on`.
+
+## Deviations in Task 12 as implemented
+
+- **The plan's own remedy strings broke the plan's own 58-column gate** (70 EN / 79 ES). Shipped
+  `"Unlock it and restart, or set ANTHROPIC_API_KEY."` (48) and the ES equivalent (52) — concrete,
+  fits, and keeps the token the reviewer's render probe asserts on.
+- **The new width gate exposed two pre-existing over-budget keys**, so they were shortened in both
+  locales: `provider.offline.nothing` (EN 92 → 57) and `provider.offline.missing_key` (EN 77 → 49).
+  EN 92 exceeded even the 78 usable columns of an 80-column engine list, so this was the same defect
+  already shipped. `nothing` lost its "(or another provider's key)" parenthetical.
+- **`offline_models_step` does not use `provider_info.id`**, contrary to the task's checkbox: once the
+  offline fallback has happened that id is `"local"`, which never matches a `StoreFailure` and would
+  render "set local's API key". It uses the same slice-collapse rule as `notices` instead — one
+  failure names its provider, several name none.
+- **`models.store_remedy` no longer interpolates `{provider}`**, because the collapsed branch was
+  still rendering "set anthropic's API key" for a store that failed for everyone. The render
+  assertion caught it.
+- The 58-column budget is justified by `models_view` rendering `offline_notice` into `draw_popup`'s
+  box, **not** by `draw_engine` (whose list is 78 columns at 80). The task's stated rationale was
+  wrong; the narrower number is still the right one.
+
+Known, accepted, and recorded rather than fixed: Ctrl+R on the collapsed branch still re-fetches
+`store_failures[0]`. Nothing rendered names it, and the fetch does re-read the store, so it is the
+provider key precedence would pick once the store answers — but it is not literally the provider the
+user chose, and saying so would need `ModelsStep::Credentials.provider` to become an `Option`.
