@@ -479,7 +479,8 @@ impl App {
         match self.store.set(&provider, &key) {
             Ok(()) => {
                 self.rebuild_provider();
-                self.status = self.t_with("status.key_set", &[("provider", &provider)]);
+                self.status =
+                    self.t_with("status.key_stored_unverified", &[("provider", &provider)]);
             }
             Err(e) => {
                 let error = e.to_string();
@@ -3642,6 +3643,33 @@ mod tests {
             Some(ConnectStep::KeyEntry { .. })
         ));
         assert!(app.error.is_some());
+    }
+
+    /// `store.set` returning `Ok` means the OS keyring accepted a string, not that the provider
+    /// will accept it as a credential — so the status must not read as verification (#61).
+    ///
+    /// A `tokio::test` because `submit_key_entry` spawns the verification probe, and the body
+    /// deliberately never awaits: on the current-thread test runtime nothing drives the run queue
+    /// between the spawn and the end of the test, so the probe is dropped unpolled and no request
+    /// is issued. Nothing on this path calls `resolve_key` either, so an exported `OPENAI_API_KEY`
+    /// cannot change either assertion.
+    #[tokio::test]
+    async fn submitting_a_key_reports_it_as_stored_but_unverified() {
+        let mut app = test_app();
+        app.key_target = Some("openai".to_string());
+        app.key_input = "sk-test-key".to_string();
+
+        app.submit_key_entry();
+
+        assert_eq!(
+            app.status,
+            "API key stored for openai \u{2014} not yet verified"
+        );
+        assert_eq!(
+            app.store.get("openai").unwrap().as_deref(),
+            Some("sk-test-key"),
+            "the key must still be written to the store"
+        );
     }
 
     #[test]

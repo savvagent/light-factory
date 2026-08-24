@@ -204,7 +204,10 @@ const EN: Catalog = &[
         "status.model_unsupported",
         "The active provider has no model to set",
     ),
-    ("status.key_set", "API key saved for {provider}"),
+    (
+        "status.key_stored_unverified",
+        "API key stored for {provider} \u{2014} not yet verified",
+    ),
     ("status.key_cleared", "API key cleared for {provider}"),
     (
         "status.key_failed",
@@ -513,7 +516,10 @@ const ES: Catalog = &[
         "status.model_unsupported",
         "El proveedor activo no tiene modelo que configurar",
     ),
-    ("status.key_set", "Clave de API guardada para {provider}"),
+    (
+        "status.key_stored_unverified",
+        "Clave de API guardada para {provider} \u{2014} aún sin verificar",
+    ),
     (
         "status.key_cleared",
         "Clave de API eliminada para {provider}",
