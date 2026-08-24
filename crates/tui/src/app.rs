@@ -848,11 +848,10 @@ impl App {
                 self.push_log(message.clone());
                 self.modal
                     .replace_step(Modal::Models(if err.class.needs_credentials() {
-                        let remedy = self.credentials_remedy(&provider, err.class);
                         ModelsStep::Credentials {
                             provider,
                             error: message,
-                            remedy,
+                            class: err.class,
                         }
                     } else {
                         ModelsStep::Manual {
@@ -880,23 +879,6 @@ impl App {
             // wrapping it would read "Couldn't fetch models: the credential store for openai
             // could not be read: ...".
             FetchFailure::StoreUnavailable => err.message.clone(),
-        }
-    }
-
-    /// The remedy line for a credential-class failure.
-    ///
-    /// Class-specific because `/connect` and `/key` both write to the credential store: they are
-    /// the answer to a missing or rejected key and are useless against a store that cannot be
-    /// read. Matching on every variant rather than on a wildcard is deliberate — a new class must
-    /// make this decision rather than inherit it.
-    fn credentials_remedy(&self, provider: &str, class: FetchFailure) -> String {
-        match class {
-            FetchFailure::StoreUnavailable => {
-                self.t_with("models.store_remedy", &[("provider", provider)])
-            }
-            FetchFailure::MissingKey | FetchFailure::Auth | FetchFailure::Fetch => {
-                self.t_with("models.credentials_remedy", &[("provider", provider)])
-            }
         }
     }
 
@@ -3334,43 +3316,6 @@ mod tests {
         );
     }
 
-    /// `/connect` and `/key` both write to the credential store, so neither is a remedy for a
-    /// store that cannot be read. The remedy line must differ from the one the other credential
-    /// classes get.
-    #[test]
-    fn a_store_failure_gets_its_own_remedy() {
-        let app = test_app();
-        let store = app.credentials_remedy("openai", FetchFailure::StoreUnavailable);
-        let missing = app.credentials_remedy("openai", FetchFailure::MissingKey);
-        assert_ne!(store, missing);
-        assert!(!store.is_empty(), "every class must produce a remedy");
-        assert!(
-            !store.contains("/key") && !store.contains("/connect"),
-            "the store remedy must not point at commands that write to the broken store: {store}"
-        );
-        assert!(
-            store.contains("openai"),
-            "the remedy names the provider: {store}"
-        );
-    }
-
-    /// Every credential class must produce a non-empty remedy, so a future class cannot render an
-    /// empty row.
-    #[test]
-    fn every_credential_class_has_a_remedy() {
-        let app = test_app();
-        for class in [
-            FetchFailure::MissingKey,
-            FetchFailure::Auth,
-            FetchFailure::StoreUnavailable,
-        ] {
-            assert!(
-                !app.credentials_remedy("openai", class).is_empty(),
-                "{class:?} has no remedy"
-            );
-        }
-    }
-
     /// `connect.store_unavailable` already names the provider and the cause, so wrapping it in
     /// `connect.fetch_error` would read "Couldn't fetch models: the credential store for openai
     /// could not be read: ...".
@@ -3399,14 +3344,14 @@ mod tests {
                 "the credential store for openai could not be read: locked",
             )),
         );
-        let Some(ModelsStep::Credentials { error, remedy, .. }) = models_step(&app) else {
+        let Some(ModelsStep::Credentials { error, class, .. }) = models_step(&app) else {
             panic!(
                 "a store failure must not offer a model-id box, got {:?}",
                 models_step(&app)
             );
         };
         assert!(error.contains("could not be read"), "{error}");
-        assert!(!remedy.contains("/key"), "{remedy}");
+        assert_eq!(*class, FetchFailure::StoreUnavailable);
     }
 
     #[test]
@@ -3473,7 +3418,7 @@ mod tests {
             Modal::Models(ModelsStep::Credentials {
                 provider: "openai".to_string(),
                 error: "openai rejected the credential".to_string(),
-                remedy: "remedy".to_string(),
+                class: FetchFailure::Auth,
             }),
         );
         let before = app.modal.nonce();

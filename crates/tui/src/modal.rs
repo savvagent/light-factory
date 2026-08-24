@@ -143,15 +143,13 @@ pub(crate) enum ModelsStep {
     /// or the credential store could not be read). Typing a model id cannot repair a credential,
     /// so this step shows a remedy and takes no input.
     ///
-    /// `remedy` is already localized and already class-specific: `/connect` and `/key` are the
-    /// answer to a missing or rejected key, and are useless against a store that cannot be read,
-    /// so the step carries the sentence rather than deriving it at render time. It also follows
-    /// the sibling `error` field, which `app.rs` already precomputes: the class-based branching
-    /// stays in the one module that owns it.
+    /// The step carries the failure *class*, not a pre-localized remedy sentence: the remedy is
+    /// looked up at render time so `/lang` cannot leave it stale on an open modal, and the
+    /// class-based branch stays in the module that defines [`FetchFailure`].
     Credentials {
         provider: String,
         error: String,
-        remedy: String,
+        class: FetchFailure,
     },
     Offline,
 }
@@ -176,13 +174,26 @@ pub(crate) enum FetchFailure {
 }
 
 impl FetchFailure {
+    /// The i18n key of the remedy for this class, or `None` when the remedy is simply to retry.
+    ///
+    /// This is the single statement of "what can the user do about it": `needs_credentials` is
+    /// `remedy_key().is_some()`, and both render sites look the string up here rather than
+    /// carrying a pre-localized copy that `/lang` would leave stale.
+    pub(crate) fn remedy_key(self) -> Option<&'static str> {
+        match self {
+            // `/connect` and `/key` both write to the credential store, so neither is a remedy
+            // for a store that cannot be read.
+            FetchFailure::StoreUnavailable => Some("models.store_remedy"),
+            FetchFailure::MissingKey | FetchFailure::Auth => Some("models.credentials_remedy"),
+            FetchFailure::Fetch => None,
+        }
+    }
+
     /// Whether the remedy is a credential (`/connect`, `/key`) rather than a retry. The single
-    /// predicate the modal branches on, so a future class only has to answer this question.
+    /// predicate the modal branches on, so a future class only has to answer this question —
+    /// which it must, in [`FetchFailure::remedy_key`]'s exhaustive match.
     pub(crate) fn needs_credentials(self) -> bool {
-        matches!(
-            self,
-            FetchFailure::MissingKey | FetchFailure::Auth | FetchFailure::StoreUnavailable
-        )
+        self.remedy_key().is_some()
     }
 }
 
@@ -1175,15 +1186,21 @@ fn models_view(step: &ModelsStep, ctx: &ModalContext<'_>) -> PopupView {
         // count, so nothing should be clipped — but if a very short terminal clips anyway, what
         // survives must be the remedy rather than the remote-supplied error that would otherwise
         // have displaced it.
-        ModelsStep::Credentials { error, remedy, .. } => {
+        ModelsStep::Credentials {
+            provider,
+            error,
+            class,
+        } => {
             lines.push(Line::from(Span::styled(
                 i18n::t(ctx.locale, "models.credentials_hint"),
                 Style::default().fg(Color::DarkGray),
             )));
-            lines.push(Line::from(Span::styled(
-                remedy.clone(),
-                Style::default().fg(Color::DarkGray),
-            )));
+            if let Some(key) = class.remedy_key() {
+                lines.push(Line::from(Span::styled(
+                    i18n::t_with(ctx.locale, key, &[("provider", provider)]),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 error.clone(),
@@ -1386,12 +1403,26 @@ mod tests {
     use super::*;
 
     /// A minimal render context: no app-level error, no offline reason.
-    fn ctx() -> ModalContext<'static> {
+    fn ctx(locale: Locale) -> ModalContext<'static> {
         ModalContext {
-            locale: Locale::En,
+            locale,
             error: None,
             offline: None,
         }
+    }
+
+    /// Every rendered body row, flattened to one string.
+    fn body_text(view: &PopupView) -> String {
+        view.body
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn model_apply(provider: &str, model: &str, verified: bool) -> ModalTransition {
@@ -1991,7 +2022,7 @@ mod tests {
         let step = ModelsStep::Credentials {
             provider: "openai".to_string(),
             error: "refused".to_string(),
-            remedy: "remedy".to_string(),
+            class: FetchFailure::Auth,
         };
         assert_eq!(
             models_step_next(&step, ctrl_key(KeyCode::Char('r'))),
@@ -2031,7 +2062,7 @@ mod tests {
         let step = ModelsStep::Credentials {
             provider: "openai".to_string(),
             error: "refused".to_string(),
-            remedy: "remedy".to_string(),
+            class: FetchFailure::Auth,
         };
         assert_eq!(
             models_step_next(&step, key(KeyCode::Esc)),
@@ -2223,6 +2254,42 @@ mod tests {
         assert!(!FetchFailure::Fetch.needs_credentials());
     }
 
+    /// Every credential class names a remedy, and a store failure's differs from the one the
+    /// key-shaped failures get — `/connect` and `/key` both write to the store that just failed.
+    #[test]
+    fn every_credential_class_names_its_own_remedy() {
+        for class in [
+            FetchFailure::MissingKey,
+            FetchFailure::Auth,
+            FetchFailure::StoreUnavailable,
+        ] {
+            assert!(class.remedy_key().is_some(), "{class:?} has no remedy");
+        }
+        assert_eq!(
+            FetchFailure::Fetch.remedy_key(),
+            None,
+            "a retryable failure has no remedy"
+        );
+        assert_ne!(
+            FetchFailure::StoreUnavailable.remedy_key(),
+            FetchFailure::MissingKey.remedy_key()
+        );
+    }
+
+    /// The rendered remedy follows the locale in force at render time, not the one that happened
+    /// to be set when the step was built — `/lang` can change it while the modal is open.
+    #[test]
+    fn the_credentials_remedy_is_rendered_in_the_current_locale() {
+        let step = ModelsStep::Credentials {
+            provider: "openai".to_string(),
+            error: "refused".to_string(),
+            class: FetchFailure::Auth,
+        };
+        let en = models_view(&step, &ctx(Locale::En));
+        let es = models_view(&step, &ctx(Locale::Es));
+        assert_ne!(body_text(&en), body_text(&es));
+    }
+
     /// The provider's own text is remote-controlled and unbounded. It reaches a rendered line, so
     /// it is reduced to one control-free line and capped before it can push the modal's trusted
     /// rows off screen.
@@ -2379,7 +2446,7 @@ mod tests {
         let credentials = ModelsStep::Credentials {
             provider: "openai".to_string(),
             error: "nope".to_string(),
-            remedy: "remedy".to_string(),
+            class: FetchFailure::Auth,
         };
         assert_eq!(
             models_step_next(&credentials, key(KeyCode::Enter)),
@@ -2563,7 +2630,7 @@ mod tests {
             Modal::Models(ModelsStep::Credentials {
                 provider: "openai".into(),
                 error: "nope".into(),
-                remedy: "remedy".to_string(),
+                class: FetchFailure::Auth,
             })
             .fetch_target(),
             None
@@ -2601,7 +2668,7 @@ mod tests {
             ModelsStep::Credentials {
                 provider: "openai".to_string(),
                 error: "refused".to_string(),
-                remedy: "remedy".to_string(),
+                class: FetchFailure::Auth,
             },
             models_manual_step("gpt-"),
             models_list_step(vec![], false),
@@ -2639,10 +2706,10 @@ mod tests {
 
     #[test]
     fn only_help_hides_the_screen_underneath_it() {
-        assert!(Modal::Help.view(&ctx()).covers_base());
+        assert!(Modal::Help.view(&ctx(Locale::En)).covers_base());
         assert!(
             !Modal::Models(models_list_step(vec![], true))
-                .view(&ctx())
+                .view(&ctx(Locale::En))
                 .covers_base()
         );
         assert!(
@@ -2650,7 +2717,7 @@ mod tests {
                 rows: vec![],
                 selected: 0
             })
-            .view(&ctx())
+            .view(&ctx(Locale::En))
             .covers_base()
         );
     }
