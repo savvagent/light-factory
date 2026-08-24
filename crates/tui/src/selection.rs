@@ -177,15 +177,6 @@ pub fn apply_preferences(
     (base, failures)
 }
 
-/// Assemble the effective [`Selection`]: environment (via the providers crate), then the stored
-/// keys and persisted preferences layered on top, plus any store failure encountered.
-pub fn build_selection(
-    settings: &Settings,
-    store: &dyn CredentialStore,
-) -> (Selection, Vec<StoreFailure>) {
-    apply_preferences(selection_from_env(), settings, store)
-}
-
 /// Build the provider and its display record from an explicit [`Selection`]. Pure.
 fn build_and_info(selection: &Selection) -> (Arc<dyn Provider>, ProviderInfo) {
     let built = build_provider(selection);
@@ -201,15 +192,28 @@ fn build_and_info(selection: &Selection) -> (Arc<dyn Provider>, ProviderInfo) {
     (Arc::from(built.provider), info)
 }
 
-/// Build the active provider and its display record from the given settings and credential store.
+/// Build the active provider and its display record from an explicit base [`Selection`], the same
+/// seam [`resolve_key_with`] gives the per-provider path: the base is supplied so a test can pin
+/// the outcome without the process environment deciding it.
+fn rebuild_from(
+    base: Selection,
+    settings: &Settings,
+    store: &dyn CredentialStore,
+) -> (Arc<dyn Provider>, ProviderInfo) {
+    let (selection, store_failures) = apply_preferences(base, settings, store);
+    let (provider, mut info) = build_and_info(&selection);
+    info.store_failures = store_failures;
+    (provider, info)
+}
+
+/// Build the active provider and its display record from the given settings and credential store:
+/// the environment (via the providers crate), then the stored keys and persisted preferences
+/// layered on top.
 pub fn rebuild(
     settings: &Settings,
     store: &dyn CredentialStore,
 ) -> (Arc<dyn Provider>, ProviderInfo) {
-    let (selection, store_failures) = build_selection(settings, store);
-    let (provider, mut info) = build_and_info(&selection);
-    info.store_failures = store_failures;
-    (provider, info)
+    rebuild_from(selection_from_env(), settings, store)
 }
 
 #[cfg(test)]
@@ -302,6 +306,11 @@ mod tests {
             KeyStatus::Unavailable,
             "a store that cannot answer is not the same as a store with no key"
         );
+        // An empty env value is absent, so it falls through to the store — which is broken.
+        assert_eq!(
+            key_status_with("openai", &broken, blank),
+            KeyStatus::Unavailable
+        );
     }
 
     /// A working environment variable must not be reported as unavailable because the keyring is
@@ -371,7 +380,7 @@ mod tests {
     /// The public entry point, deterministic under any ambient environment: `ollama` declares no
     /// env var, so `process_env` is never consulted and only the store can answer.
     #[test]
-    fn resolve_key_delegates_to_the_process_env_reader() {
+    fn resolve_key_reads_the_store_for_a_provider_with_no_env_var() {
         let store = MemStore::new();
         store.set("ollama", "sk-ring").unwrap();
         let KeyResolution::Found(key) = resolve_key("ollama", &store) else {
@@ -453,16 +462,20 @@ mod tests {
 
     /// `rebuild` is the startup entry point; the failures have to survive it or nothing can
     /// render them.
-    /// `build_selection` starts from `selection_from_env()`, so a developer with all four of
-    /// `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`GEMINI_API_KEY`/`DEEPSEEK_API_KEY` exported would see
-    /// every provider skipped before the store is read and no failure recorded. That is the same
-    /// ambient-env caveat the App-level tests carry; the injected-env assertions live in
-    /// `apply_preferences_reports_a_store_failure_for_every_remote_provider` above.
+    ///
+    /// Driven from an explicit base so the process environment cannot decide the outcome: with all
+    /// four provider keys exported the ambient form silently recorded no failures at all.
     #[test]
     fn rebuild_carries_store_failures_into_the_provider_info() {
-        let broken = FailingStore::default();
-        let (_provider, info) = rebuild(&settings(None), &broken);
-        assert!(!info.store_failures.is_empty());
+        let broken = FailingStore::new("no D-Bus session");
+        let (_provider, info) = rebuild_from(Selection::default(), &settings(None), &broken);
+        assert_eq!(info.store_failures.len(), REMOTE_IDS.len());
+        assert!(
+            info.store_failures
+                .iter()
+                .all(|f| f.error == "no D-Bus session")
+        );
+        assert!(info.store_failures.iter().any(|f| f.provider == "openai"));
     }
 
     #[test]

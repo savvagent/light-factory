@@ -1207,10 +1207,11 @@ fn models_view(step: &ModelsStep, ctx: &ModalContext<'_>) -> PopupView {
                 footer = i18n::t(ctx.locale, "models.footer_list");
             }
         }
-        // Trusted rows first, provider text last. `draw_popup` sizes itself from the wrapped row
+        // Trusted rows first, foreign text last. `draw_popup` sizes itself from the wrapped row
         // count, so nothing should be clipped — but if a very short terminal clips anyway, what
-        // survives must be the remedy rather than the remote-supplied error that would otherwise
-        // have displaced it.
+        // survives must be the remedy rather than the foreign error text (a provider's or the
+        // credential store's) that would otherwise have displaced it. `MissingKey`'s text is our
+        // own i18n string, and is ordered the same way for uniformity.
         ModelsStep::Credentials {
             provider,
             error,
@@ -2326,7 +2327,8 @@ mod tests {
     /// `MissingKey`, and the sentence names the store rather than claiming there is no key.
     ///
     /// The provider is `local` because it declares no env var (as `selection.rs`'s
-    /// `resolve_key_delegates_to_the_process_env_reader` uses `ollama` for the same reason):
+    /// `resolve_key_reads_the_store_for_a_provider_with_no_env_var` uses `ollama` for the same
+    /// reason):
     /// `fetch_model_list` reads the *process* environment and has no injection seam, so with
     /// `openai` a developer with `OPENAI_API_KEY` exported would resolve an env key here, escape
     /// to a real network call, and get `Auth` instead. Keyless means only the store can answer,
@@ -2343,6 +2345,22 @@ mod tests {
         assert!(
             !err.message.contains("No API key"),
             "the store failure must not be reported as a missing key: {}",
+            err.message
+        );
+    }
+
+    /// The composed sentence carries the keyring's own text, which a hostile or merely verbose
+    /// backend controls the length of. Uncapped it displaces the modal's own remedy row.
+    #[tokio::test]
+    async fn a_verbose_store_error_is_capped_before_it_reaches_the_modal() {
+        let store = light_factory_tui::credentials::FailingStore::new("x".repeat(1000));
+        let err = fetch_model_list("local", None, &store, Locale::En)
+            .await
+            .expect_err("an unreadable store cannot produce a model list");
+        assert!(err.message.chars().count() <= PROVIDER_ERROR_MAX_CHARS + 1);
+        assert!(
+            err.message.contains("local"),
+            "the provider survives the cut: {}",
             err.message
         );
     }
@@ -2376,6 +2394,22 @@ mod tests {
         assert_ne!(
             FetchFailure::StoreUnavailable.remedy_key(),
             FetchFailure::MissingKey.remedy_key()
+        );
+
+        let store = i18n::t_with(
+            Locale::En,
+            FetchFailure::StoreUnavailable
+                .remedy_key()
+                .expect("a credential class"),
+            &[("provider", "openai")],
+        );
+        assert!(
+            store.contains("openai"),
+            "the remedy names the provider: {store}"
+        );
+        assert!(
+            !store.contains("/key") && !store.contains("/connect"),
+            "both write to the store that just failed: {store}"
         );
     }
 

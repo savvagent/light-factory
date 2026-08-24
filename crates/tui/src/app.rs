@@ -643,8 +643,8 @@ impl App {
             .iter()
             .map(|id| {
                 let key = if *id == "ollama" {
-                    // Ollama takes no API key; `LIGHT_OLLAMA` is the whole of its configuration,
-                    // so the credential store is never consulted for it.
+                    // Ollama takes no API key, so the credential store is never consulted for it
+                    // — a store that cannot be read must not make this row "unavailable".
                     if std::env::var("LIGHT_OLLAMA").as_deref() == Ok("1") {
                         RowKey::Present
                     } else {
@@ -2070,7 +2070,9 @@ mod tests {
         }
     }
 
-    /// A store whose `set` always fails, for exercising the keyring write-failure branch.
+    /// A store whose `set` always fails, for exercising the keyring write-failure branch. Not the
+    /// library's `FailingStore`: this needs `get` to succeed while `set` fails, a shape
+    /// `FailingStore` cannot produce.
     struct SetFailsStore;
 
     impl CredentialStore for SetFailsStore {
@@ -2517,6 +2519,51 @@ mod tests {
         assert!(
             screen.contains("Ctrl+R: retry"),
             "a 401 from a proxy or a WAF is not a dead end:\n{screen}"
+        );
+    }
+
+    /// The mirror of the test above for the other credential class the step renders. A store
+    /// failure's message is the composed sentence *plus* the keyring's own text — 111 characters
+    /// here, longer than the 401's 105 — so it hits the same popup-sizing path (#57), and its
+    /// remedy is a different string that nothing rendered until now.
+    #[test]
+    fn the_store_failure_step_renders_its_own_remedy_and_never_offers_key_entry() {
+        let mut app = test_app();
+        app.mode = Mode::Connected;
+        let nonce = open(&mut app, Modal::Models(models_list_step(vec![], true)));
+
+        // The sentence `fetch_model_list` composes for an unreadable store, with a real cause.
+        let cause = "the credential store for openai could not be read: \
+                     org.freedesktop.DBus.Error.NoReply: no session bus available";
+        app.handle_models_fetched(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(FetchFailure::StoreUnavailable, cause)),
+        );
+
+        let screen = render(&mut app, 80, 20);
+        let flat = flatten(&screen);
+        assert!(
+            flat.contains(&flatten(
+                "Unlock the credential store and retry, or set openai's API key in the environment"
+            )),
+            "the store remedy is clipped:\n{screen}"
+        );
+        assert!(
+            flat.contains(&flatten(cause)),
+            "the cause must be rendered in full, not clipped:\n{screen}"
+        );
+        assert!(
+            !screen.contains("/key"),
+            "/key writes to the store that just failed:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Type a model id"),
+            "typing an id cannot repair an unreadable store:\n{screen}"
+        );
+        assert!(
+            screen.contains("Ctrl+R: retry"),
+            "an unreadable store can be a transient D-Bus blip:\n{screen}"
         );
     }
 
@@ -3419,7 +3466,7 @@ mod tests {
     fn handle_models_fetched_routes_a_store_failure_to_the_credentials_step() {
         let mut app = test_app();
         // `open` rather than `App::open_modal`: the latter spawns a fetch, and this is a sync
-        // test with no tokio runtime. The helper exists at app.rs:2147 for exactly this.
+        // test with no tokio runtime. That is what the `open` helper above exists for.
         let nonce = open(&mut app, Modal::Models(models_list_step(vec![], true)));
         app.handle_models_fetched(
             nonce,
@@ -3800,38 +3847,39 @@ mod tests {
         ));
     }
 
-    /// `/key` must not list a provider as having no key when the store could not be asked.
-    ///
-    /// The assertion is the negative on purpose: `key_status` reads the *process* environment and
-    /// `App` has no injection seam for it, so a developer with `OPENAI_API_KEY` exported gets
-    /// `env` here and anyone else gets `unavailable`. Both are correct; `none` is the defect. The
-    /// strict `KeyStatus::Unavailable` assertion lives in `selection.rs`, where the env is
-    /// injected.
+    /// Wire the `Unavailable` arm to `provider.key.keyring` and the old negative assertion still
+    /// passed — `/key` would report a live keyring for a dead one. `ollama` declares no env var, so
+    /// `process_env` cannot decide this and the assertion can be strict.
     #[test]
-    fn the_key_listing_never_reports_an_unreadable_store_as_no_key() {
+    fn an_unreadable_store_is_labelled_unavailable() {
         let app = test_app_with_store(Arc::new(
             light_factory_tui::credentials::FailingStore::default(),
         ));
-        assert_ne!(app.key_status_label("openai"), app.t("provider.key.none"));
+        assert_eq!(
+            app.key_status_label("ollama"),
+            app.t("provider.key.unavailable")
+        );
     }
 
-    /// An unreadable store must not render a provider as though no key were stored — that is the
-    /// row state that routes Enter to key entry.
-    ///
-    /// Negative assertion for the same reason as `the_key_listing_never_reports_...`: with
-    /// `OPENAI_API_KEY` exported this row is `Present`, without it `Unavailable`. `Absent` is the
-    /// defect. `RowKey::Unavailable` itself is pinned in `modal.rs`'s transition tests.
+    /// Map `Unavailable` to `Present` and the old negative assertion still passed — the row would
+    /// read "openai (connected)" for a store that cannot be read, which is worse than the bug this
+    /// fixes. `openai` stays a negative because the ambient env can make its row `Present`, and
+    /// `ollama` — the only keyless row in `PROVIDER_NAMES` — takes the special case above rather
+    /// than the mapping, so the strict `KeyStatus::Unavailable` assertion still lives in
+    /// `selection.rs`'s `key_status_with_classifies_every_wiring_outcome`.
     #[test]
-    fn provider_rows_never_report_an_unreadable_store_as_having_no_key() {
+    fn provider_rows_report_an_unreadable_store() {
         let app = test_app_with_store(Arc::new(
             light_factory_tui::credentials::FailingStore::default(),
         ));
         let rows = app.build_provider_rows();
-        let openai = rows
-            .iter()
-            .find(|r| r.id == "openai")
-            .expect("openai is a listed provider");
+        let openai = rows.iter().find(|r| r.id == "openai").expect("listed");
         assert_ne!(openai.key, RowKey::Absent);
+
+        // Ollama takes no API key, so a broken store must never label it "key store unavailable" —
+        // the special case in `build_provider_rows` had no test at all.
+        let ollama = rows.iter().find(|r| r.id == "ollama").expect("listed");
+        assert_ne!(ollama.key, RowKey::Unavailable);
     }
 
     #[test]

@@ -771,7 +771,7 @@ mod tests {
     /// because every render assertion runs in EN.
     #[test]
     fn every_footer_fits_the_popup_in_both_locales() {
-        // `draw_popup` draws a 60-column box with a one-column border on each side.
+        // `modal.rs`'s `draw_popup` draws a 60-column box with a one-column border on each side.
         const INNER_WIDTH: usize = 58;
         for (catalog, name) in [(EN, "EN"), (ES, "ES")] {
             for (key, value) in catalog {
@@ -787,11 +787,13 @@ mod tests {
         }
     }
 
-    /// The connect modal's provider rows share the footers' 60-column popup (58 inner), but
+    /// The connect modal's provider rows share the footers' popup, but
     /// `every_footer_fits_the_popup_in_both_locales` gates `*.footer` keys only. `anthropic` is
-    /// the longest id in `PROVIDER_NAMES`, and the row is drawn as `"> {id} ({suffix})"`.
+    /// the longest id in `PROVIDER_NAMES`, duplicated by hand from `app.rs` because this crate's
+    /// modules are private to the binary; the row is drawn as `"> {id} ({suffix})"`.
     #[test]
     fn the_unavailable_row_suffix_fits_the_popup_in_both_locales() {
+        // Same 58 columns as above, and from the same source: `draw_popup`'s 60-column box.
         const INNER_WIDTH: usize = 58;
         for (locale, name) in [(Locale::En, "EN"), (Locale::Es, "ES")] {
             let row = format!(
