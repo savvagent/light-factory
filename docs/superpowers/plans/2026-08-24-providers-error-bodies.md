@@ -233,12 +233,18 @@ Append the new tests:
         // Gateways and proxies answer with HTML or text/plain, and the first line is often the only
         // signal there is. Later lines are dropped: a multi-line error pushes the modal's own
         // trusted rows off the screen.
+        //
+        // The second-line marker must not overlap `reqwest::Error`'s own status Display, which is
+        // kept as the anyhow *source* and reads `HTTP status server error (502 Bad Gateway) for url
+        // (...)`. Asserting `!chain.contains("Bad Gateway")` would fail unconditionally — not
+        // because the first-line rule broke, but because the status phrase is supposed to be there.
+        const SECOND_LINE: &str = "SECOND-LINE-MUST-NOT-SURVIVE";
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(
                 ResponseTemplate::new(502)
-                    .set_body_string("upstream connect error\n<html>502 Bad Gateway</html>"),
+                    .set_body_string(format!("upstream connect error\n{SECOND_LINE}")),
             )
             .mount(&server)
             .await;
@@ -253,7 +259,7 @@ Append the new tests:
             "the first line of a non-JSON body must survive: {chain}"
         );
         assert!(
-            !chain.contains("Bad Gateway"),
+            !chain.contains(SECOND_LINE),
             "only the first line may survive: {chain}"
         );
     }
@@ -281,10 +287,16 @@ Append the new tests:
 
     #[tokio::test]
     async fn an_oversized_error_body_is_refused_rather_than_captured() {
-        // The error path is reached *without* a valid credential, so it is strictly more exposed
-        // than the success path. `read_capped` refuses rather than truncates, so an over-cap error
-        // body degrades to the status line — which is exactly the pre-#59 behaviour, and strictly
-        // better than an attacker-sized allocation.
+        // What this pins: that the error read is governed by `max_error_bytes` rather than by the
+        // far larger `max_body_bytes`, and that refusing degrades to the status line with no body
+        // content leaking. It deliberately does NOT re-pin `read_capped`'s cumulative running-total
+        // bound — a body this small arrives in a single frame, so the check trips on iteration one.
+        // That property is pinned on the same function by `an_oversized_body_is_refused_instead_of
+        // _buffered`, which sizes its body above hyper's largest read frame precisely to bind it;
+        // duplicating a multi-megabyte body here would buy nothing.
+        //
+        // The error path matters more than the success path, not less: it is reached *without* a
+        // valid credential.
         const MARKER: &str = "RUN-THIS-COMMAND";
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -320,12 +332,19 @@ Append the new tests:
         // A misconfigured gateway — or an attacker-chosen `*_BASE_URL` override — can echo the
         // submitted key back in its error body. Rendering that into a terminal cell would put the
         // user's live credential into their scrollback.
+        // The padding is load-bearing, not decoration. It pushes the key across the
+        // `DETAIL_MAX_CHARS` boundary so this test pins the *order* of the transforms, not just
+        // that redaction happens at all: redact-then-cap yields a 191-character detail with no key
+        // in it, while cap-then-redact would keep the first ~37 characters of the key — a usable
+        // prefix — and `!chain.contains("0123456789abcdef")` is what catches that.
         const KEY: &str = "sk-test-0123456789abcdef0123456789abcdef";
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
-                "error": { "message": format!("The API key {KEY} is not authorized") }
+                "error": {
+                    "message": format!("{} The API key {KEY} is not authorized", "x".repeat(150))
+                }
             })))
             .mount(&server)
             .await;
@@ -641,32 +660,32 @@ Update the four call sites:
 Run: `cargo test -p light-factory-providers 2>&1 | tail -40`
 
 Expected: PASS — all ten new tests plus every pre-existing test in the crate. In particular
-`an_auth_error_is_surfaced_as_an_error` (the outermost message still names 401) and
-`a_stalled_endpoint_fails_at_the_deadline` (the timeout still downcasts at the anyhow root, because
-it fires at `send()` before any status check) must stay green **unmodified**.
+`an_auth_error_is_surfaced_as_an_error` must stay green **unmodified**: its outermost message
+becomes `the provider returned HTTP 401 with no error detail`, which still contains `401`. And
+`a_stalled_endpoint_fails_at_the_deadline` must stay green unmodified too: the timeout fires at
+`send()`, before any status check, so it is still the anyhow **root** and still downcasts to
+`reqwest::Error`.
 
-If `check_status`'s `let Some(status_err) = raw.error_for_status_ref().err() else { ... }` fails to
-borrow-check, do **not** clone the response or reach for `unsafe`. Rewrite it as:
+The `let Some(status_err) = raw.error_for_status_ref().err() else { return Ok(raw); };` form has
+been verified to borrow-check: `.err()` yields an owned `reqwest::Error`, and the `&Response`
+temporary dies at the end of the `let` statement, so moving `raw` into `error_detail` on the next
+line is accepted.
 
-```rust
-    if raw.status().is_success() {
-        return Ok(raw);
-    }
-    let status_err = raw
-        .error_for_status_ref()
-        .err()
-        .expect("a non-success status must produce an error");
-```
+- [ ] **Step 7: Format, then run the whole workspace suite and the lints**
 
-- [ ] **Step 7: Run the whole workspace suite and the lints**
+`cargo fmt --all` runs **first**, not at commit time: several of the snippets above are not
+rustfmt-clean as written (the `Err(anyhow::Error::new(...).context(match ...))` block and four
+`assert!`s get rewrapped), and success criterion 6 of the spec includes `cargo fmt --all --check`.
+Formatting before the gate is what makes that criterion actually verified here rather than assumed.
 
-Run:
 ```bash
+cargo fmt --all
 cargo test --workspace 2>&1 | tail -30
 cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -30
+cargo fmt --all --check && echo "fmt clean"
 ```
 
-Expected: both clean. `crates/tui`'s
+Expected: all clean. `crates/tui`'s
 `class_for_status_treats_only_401_and_403_as_credential_failures` must be green **and unmodified** —
 no classification rule changed.
 
@@ -677,10 +696,10 @@ Run: `git diff --stat origin/master -- crates/`
 Expected: `crates/providers/src/models.rs` only. Any line under `crates/tui` is a scope violation
 (PR #68 is in flight there) — revert it.
 
-- [ ] **Step 9: Format and commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-cargo fmt --all
+cargo fmt --all   # no-op if Step 7 already ran; the repo rule is fmt before every Rust commit
 git add crates/providers/src/models.rs
 git commit -m "providers: carry the provider's error body into model-list failures"
 ```
