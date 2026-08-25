@@ -30,12 +30,14 @@ fn process_env(var: &str) -> Option<String> {
 
 /// The env-supplied key for `provider`, if the environment supplies a usable one.
 ///
-/// An empty value is treated as absent, so the connect flow never fetches with an empty key. Both
-/// [`key_status_with`] and [`resolve_key_with`] go through here, so the rule has one source of
-/// truth rather than being restated at each of them.
+/// Surrounding whitespace is stripped and a value that is empty after trimming is treated as
+/// absent, so the connect flow never fetches with a padded or blank key. Both [`key_status_with`]
+/// and [`resolve_key_with`] go through here, so the rule has one source of truth rather than being
+/// restated at each of them.
 fn env_key(provider: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
     env_key_var(provider)
         .and_then(env)
+        .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty())
 }
 
@@ -239,12 +241,17 @@ mod tests {
     }
 
     #[test]
-    fn env_key_treats_an_empty_value_as_absent() {
+    fn env_key_treats_a_blank_value_as_absent() {
         assert_eq!(
             env_key("openai", |_| Some("sk-env".to_string())),
             Some("sk-env".to_string())
         );
         assert_eq!(env_key("openai", |_| Some(String::new())), None);
+        assert_eq!(env_key("openai", |_| Some(" \t\n".to_string())), None);
+        assert_eq!(
+            env_key("openai", |_| Some("  sk-env\n".to_string())),
+            Some("sk-env".to_string())
+        );
         assert_eq!(env_key("openai", |_| None), None);
     }
 
@@ -295,11 +302,19 @@ mod tests {
         let broken = FailingStore::default();
         let set = |_: &str| Some("sk-env".to_string());
         let blank = |_: &str| Some(String::new());
+        let blank_ws = |_: &str| Some(" \t\n".to_string());
+        let padded = |_: &str| Some("  sk-env\n".to_string());
         let unset = |_: &str| None;
 
         assert_eq!(key_status_with("openai", &empty, set), KeyStatus::Env);
+        assert_eq!(key_status_with("openai", &empty, padded), KeyStatus::Env);
         assert_eq!(key_status_with("openai", &ring, blank), KeyStatus::Keyring);
+        assert_eq!(
+            key_status_with("openai", &ring, blank_ws),
+            KeyStatus::Keyring
+        );
         assert_eq!(key_status_with("openai", &ring, unset), KeyStatus::Keyring);
+        assert_eq!(key_status_with("openai", &empty, blank_ws), KeyStatus::None);
         assert_eq!(key_status_with("openai", &empty, unset), KeyStatus::None);
         assert_eq!(
             key_status_with("openai", &broken, unset),
@@ -354,9 +369,9 @@ mod tests {
         );
     }
 
-    /// The empty-env-value rule holds through the wiring, not only inside `env_key`.
+    /// The blank-env-value rule holds through the wiring, not only inside `env_key`.
     #[test]
-    fn resolve_key_with_treats_an_empty_env_value_as_absent() {
+    fn resolve_key_with_treats_a_blank_env_value_as_absent() {
         let store = MemStore::new();
         store.set("openai", "sk-ring").unwrap();
         let KeyResolution::Found(key) = resolve_key_with("openai", &store, |_| Some(String::new()))
@@ -364,6 +379,17 @@ mod tests {
             panic!("expected the keyring value");
         };
         assert_eq!(key, "sk-ring");
+        let KeyResolution::Found(key) =
+            resolve_key_with("openai", &store, |_| Some("   ".to_string()))
+        else {
+            panic!("expected the keyring value");
+        };
+        assert_eq!(key, "sk-ring");
+        assert_eq!(
+            resolve_key_with("openai", &store, |_| Some("sk-env\n".to_string())),
+            KeyResolution::Found("sk-env".to_string()),
+            "a padded env key resolves trimmed, not raw"
+        );
     }
 
     /// The distinction the whole change exists for: a store that fails is not a store with no
