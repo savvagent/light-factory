@@ -89,11 +89,12 @@ independently revertable without leaving a red bisect point.
   - `normalize_env_key_treats_a_whitespace_only_value_as_absent`: `" \t\r\n"` → `None`.
   - `normalize_env_key_treats_an_empty_value_as_absent`: `String::new()` → `None`.
   - `normalize_env_key_preserves_internal_whitespace`: `"abc def "` → `Some("abc def")`.
-  - `keys_from_reads_only_the_declared_vars`: stub returns `Some(format!("k-{var}"))` for every
-    var; assert all four ids map to `k-<VAR>` (proves `env_key_var` naming flows through) and,
-    via a counting stub over an id like `"ollama"`, that undeclared ids are never consulted —
-    mirror the spirit of the tui's
-    `resolve_key_never_reads_the_env_for_a_provider_with_no_declared_var`.
+  - `keys_from_reads_only_the_declared_vars`: stub returns `Some(format!("k-{var}"))`; assert all
+    four ids map to `k-<VAR>` (proves `env_key_var` naming flows through), and — since the four ids
+    are hardcoded inside `keys_from` — a counting stub proves `read` is consulted exactly **four**
+    times, once per declared variable, never for anything else.
+      (Illustrative sibling: the tui's
+      `env_key_never_reads_the_env_for_a_provider_with_no_declared_var`.)
   - `keys_from_treats_a_whitespace_only_env_value_as_absent`: stub answers
     `"OPENAI_API_KEY" → Some("   \n".to_string())`, everything else `None`; assert the map is empty.
   - `keys_from_trims_a_trailing_newline_before_inserting`: stub answers
@@ -149,8 +150,10 @@ independently revertable without leaving a red bisect point.
     assertion, then add: stub `|_| Some("   ".to_string())` still resolves the keyring value, and
     stub `|_| Some("sk-env\n".to_string())` resolves
     `KeyResolution::Found("sk-env".to_string())` — trimmed, not the raw value.
-- [ ] Run `cargo test -p light-factory-tui selection` — expect the new assertions to **fail**
-      (`env_key` still filters on bare `is_empty()`); every untouched pre-existing test stays green.
+- [ ] Run `cargo test -p light-factory-tui selection` — expect the **blank/trim assertions** to fail
+      (`env_key` still filters on bare `is_empty()`); the padded→`Env` assertion passes both before
+      and after (a raw non-empty value already classifies `Env`) and pins that the fix does not
+      change provenance; every untouched pre-existing test stays green.
 - [ ] Implement in `crates/tui/src/selection.rs` exactly as the spec's §2 shows: `env_key` becomes
       `env_key_var(provider).and_then(env).map(|k| k.trim().to_string()).filter(|k| !k.is_empty())`,
       and its doc comment's "An empty value is treated as absent…" sentence becomes the whitespace
