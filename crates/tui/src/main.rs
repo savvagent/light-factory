@@ -9,6 +9,7 @@ mod provider;
 mod selection;
 mod session;
 mod settings;
+mod text;
 mod ws;
 
 use std::sync::Arc;

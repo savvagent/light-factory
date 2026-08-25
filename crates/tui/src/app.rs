@@ -35,7 +35,7 @@ use crate::config::Config;
 use crate::modal::fetch_error;
 use crate::modal::{
     ConnectStep, FetchError, FetchFailure, FetchSink, Modal, ModalApply, ModalContext, ModalHost,
-    ModalTransition, ModelsStep, ProviderRow, fetch_model_list, mask,
+    ModalTransition, ModelsStep, ProviderRow, RowKey, fetch_model_list, mask,
 };
 use crate::provider::ProviderInfo;
 use crate::selection::takes_key;
@@ -57,7 +57,7 @@ pub enum UiEvent {
     ConnectModels {
         nonce: u64,
         provider: String,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<String>, FetchError>,
     },
     ModelsFetched {
         nonce: u64,
@@ -330,13 +330,7 @@ impl App {
         self.engine_session = Some(session);
         self.engine_forward_task = Some(forwarder);
         self.engine_log.clear();
-        for warning in info.warnings {
-            self.engine_log.push(warning);
-        }
-        if let Some(reason) = &info.offline {
-            self.engine_log
-                .push(crate::provider::offline_notice(self.config.lang, reason));
-        }
+        self.engine_log.extend(info.notices(self.config.lang));
         self.engine_prompt.clear();
         self.pending = None;
         self.mode = Mode::Engine;
@@ -482,7 +476,7 @@ impl App {
                 self.status = self.t_with("status.key_set", &[("provider", &provider)]);
             }
             Err(e) => {
-                let error = e.to_string();
+                let error = crate::text::one_line(&format!("{e:#}"));
                 self.error = Some(self.t_with(
                     "status.key_failed",
                     &[("provider", &provider), ("error", &error)],
@@ -648,15 +642,26 @@ impl App {
         PROVIDER_NAMES
             .iter()
             .map(|id| {
-                let connected = if *id == "ollama" {
-                    std::env::var("LIGHT_OLLAMA").as_deref() == Ok("1")
+                let key = if *id == "ollama" {
+                    // Ollama takes no API key, so the credential store is never consulted for it
+                    // — a store that cannot be read must not make this row "unavailable".
+                    if std::env::var("LIGHT_OLLAMA").as_deref() == Ok("1") {
+                        RowKey::Present
+                    } else {
+                        RowKey::Absent
+                    }
                 } else {
-                    crate::selection::key_status(id, self.store.as_ref())
-                        != crate::selection::KeyStatus::None
+                    match crate::selection::key_status(id, self.store.as_ref()) {
+                        crate::selection::KeyStatus::Env | crate::selection::KeyStatus::Keyring => {
+                            RowKey::Present
+                        }
+                        crate::selection::KeyStatus::None => RowKey::Absent,
+                        crate::selection::KeyStatus::Unavailable => RowKey::Unavailable,
+                    }
                 };
                 ProviderRow {
                     id: id.to_string(),
-                    connected,
+                    key,
                 }
             })
             .collect()
@@ -709,12 +714,10 @@ impl App {
         let task = tokio::spawn(async move {
             let result = fetch_model_list(&provider, key, store.as_ref(), lang).await;
             let event = match sink {
-                // The connect modal renders only the message; #47's classification is consumed by
-                // the `/models` modal alone.
                 FetchSink::Connect => UiEvent::ConnectModels {
                     nonce,
                     provider,
-                    result: result.map_err(|e| e.message),
+                    result,
                 },
                 FetchSink::Models => UiEvent::ModelsFetched {
                     nonce,
@@ -731,7 +734,7 @@ impl App {
         &mut self,
         nonce: u64,
         provider: String,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<String>, FetchError>,
     ) {
         if nonce != self.modal.nonce() {
             return;
@@ -751,28 +754,32 @@ impl App {
         if !matches {
             return;
         }
-        let err_msg = result
-            .as_ref()
-            .err()
-            .map(|e| self.t_with("connect.fetch_error", &[("error", e)]));
+        // Classified before the mutable borrow: `fetch_error_message` reads `self`, and it is what
+        // keeps a sentence that already names the provider and the cause from being wrapped again.
+        let outcome = match result {
+            Ok(list) => Ok(list),
+            Err(e) => Err((self.fetch_error_message(&provider, &e), e.class)),
+        };
         if let Some(Modal::Connect(ConnectStep::ModelList {
             models,
             selected,
             fetching,
             error,
+            failure,
             ..
         })) = self.modal.current_mut()
         {
-            match result {
+            *fetching = false;
+            match outcome {
                 Ok(list) => {
                     *models = list;
                     *selected = 0;
-                    *fetching = false;
                     *error = None;
+                    *failure = None;
                 }
-                Err(_) => {
-                    *fetching = false;
-                    *error = err_msg;
+                Err((message, class)) => {
+                    *error = Some(message);
+                    *failure = Some(class);
                 }
             }
         }
@@ -781,7 +788,8 @@ impl App {
     fn enter_models(&mut self) {
         let provider = self.provider_info.id.clone();
         if self.provider_info.offline.is_some() {
-            self.open_modal(Modal::Models(ModelsStep::Offline), None);
+            let step = self.offline_models_step();
+            self.open_modal(Modal::Models(step), None);
             return;
         }
         self.open_modal(
@@ -793,6 +801,48 @@ impl App {
             }),
             None,
         );
+    }
+
+    /// The step `/models` opens when no live provider is active.
+    ///
+    /// A store failure recorded by the last `rebuild` is *why* there is no key, so the plain
+    /// offline step — "use /connect first" — would send the user into a flow that writes to the
+    /// same unreadable store. Report the store instead, on the step that carries a remedy and a
+    /// Ctrl+R that re-reads it.
+    ///
+    /// Whether the store is the cause is [`ProviderInfo::store_caused_offline`]'s question, not
+    /// this function's: reading `store_failures` alone told a user whose `*_BASE_URL` had been
+    /// rejected to unlock a keyring that was never in the way.
+    ///
+    /// The message collapses the same way `notices` does, and for the same reason. Taking
+    /// `first()` named `anthropic` every time the whole store was down — the headline scenario —
+    /// so a DeepSeek user read a sentence about Anthropic. The active provider is no better a
+    /// name: the fallback has already happened, so it is `local`, which takes no key at all.
+    fn offline_models_step(&self) -> ModelsStep {
+        let (error, provider) = match self.provider_info.store_caused_offline() {
+            [] => return ModelsStep::Offline,
+            // `KeyringStore` reads per entry, so one item failing is a real state — and the one
+            // where naming the provider matters most.
+            [only] => (
+                self.t_with(
+                    "provider.store.unavailable",
+                    &[("provider", &only.provider), ("error", &only.error)],
+                ),
+                only.provider.clone(),
+            ),
+            // Several failed, so no one provider is "the" cause. Say only what is true of all of
+            // them. Ctrl+R still re-reads the store through the first entry: it is the provider
+            // key precedence would select once the store answers again.
+            [first, ..] => (
+                self.t_with("provider.store.unavailable_all", &[("error", &first.error)]),
+                first.provider.clone(),
+            ),
+        };
+        ModelsStep::Credentials {
+            error,
+            class: FetchFailure::StoreUnavailable,
+            provider,
+        }
     }
 
     fn handle_models_fetched(
@@ -846,6 +896,7 @@ impl App {
                         ModelsStep::Credentials {
                             provider,
                             error: message,
+                            class: err.class,
                         }
                     } else {
                         ModelsStep::Manual {
@@ -869,6 +920,10 @@ impl App {
                 &[("provider", provider), ("error", &err.message)],
             ),
             FetchFailure::Fetch => self.t_with("connect.fetch_error", &[("error", &err.message)]),
+            // Already a complete sentence naming the provider and the cause, like `MissingKey`;
+            // wrapping it would read "Couldn't fetch models: the credential store for openai
+            // could not be read: ...".
+            FetchFailure::StoreUnavailable => err.message.clone(),
         }
     }
 
@@ -916,7 +971,7 @@ impl App {
         {
             let key_value = input.trim().to_string();
             if let Err(e) = self.store.set(provider, &key_value) {
-                let err = e.to_string();
+                let err = crate::text::one_line(&format!("{e:#}"));
                 self.error = Some(self.t_with(
                     "status.key_failed",
                     &[("provider", provider.as_str()), ("error", &err)],
@@ -994,7 +1049,7 @@ impl App {
                 self.status = self.t_with("status.key_cleared", &[("provider", provider)]);
             }
             Err(e) => {
-                let error = e.to_string();
+                let error = crate::text::one_line(&format!("{e:#}"));
                 self.error = Some(self.t_with(
                     "status.key_failed",
                     &[("provider", provider), ("error", &error)],
@@ -1008,6 +1063,9 @@ impl App {
             crate::selection::KeyStatus::Env => self.t("provider.key.env").to_string(),
             crate::selection::KeyStatus::Keyring => self.t("provider.key.keyring").to_string(),
             crate::selection::KeyStatus::None => self.t("provider.key.none").to_string(),
+            crate::selection::KeyStatus::Unavailable => {
+                self.t("provider.key.unavailable").to_string()
+            }
         }
     }
 
@@ -1959,7 +2017,7 @@ mod tests {
 
     use super::{
         ApiError, App, ConnectStep, EngineForward, FetchError, FetchFailure, FetchSink, KeyCommand,
-        Modal, Mode, ModelsStep, ProviderRow, Session, UiEvent, engine_approval_key,
+        Modal, Mode, ModelsStep, ProviderRow, RowKey, Session, UiEvent, engine_approval_key,
         engine_forward_step, fetch_error, parse_ask_command, parse_connect_command,
         parse_key_command, parse_model_command, parse_models_command,
     };
@@ -1995,6 +2053,7 @@ mod tests {
             offline: None,
             selected_by: None,
             warnings: Vec::new(),
+            store_failures: Vec::new(),
         };
         let (events, _rx) = mpsc::unbounded_channel::<UiEvent>();
         // Isolation by construction: no test may ever write the developer's real config.json.
@@ -2033,10 +2092,12 @@ mod tests {
         }
     }
 
-    /// A store whose `set` always fails, for exercising the keyring-failure branch.
-    struct FailingStore;
+    /// A store whose `set` always fails, for exercising the keyring write-failure branch. Not the
+    /// library's `FailingStore`: this needs `get` to succeed while `set` fails, a shape
+    /// `FailingStore` cannot produce.
+    struct SetFailsStore;
 
-    impl CredentialStore for FailingStore {
+    impl CredentialStore for SetFailsStore {
         fn get(&self, _provider: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
@@ -2173,6 +2234,7 @@ mod tests {
             selected: 0,
             fetching,
             error: None,
+            failure: None,
             from_key: false,
         }
     }
@@ -2291,6 +2353,59 @@ mod tests {
         ));
     }
 
+    /// The `/connect` sink must not re-wrap a sentence that already names the provider and the
+    /// cause: "Couldn't fetch models: the credential store for openai could not be read: ...".
+    #[test]
+    fn connect_does_not_double_wrap_a_store_failure() {
+        let mut app = test_app();
+        let nonce = open(
+            &mut app,
+            Modal::Connect(connect_model_list_step(vec![], true)),
+        );
+        app.handle_connect_models(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(
+                FetchFailure::StoreUnavailable,
+                "store for openai could not be read",
+            )),
+        );
+        let Some(ConnectStep::ModelList { error, failure, .. }) = connect_step(&app) else {
+            panic!("expected the model list, got {:?}", connect_step(&app));
+        };
+        let error = error.as_deref().expect("a failed fetch sets an error");
+        assert!(
+            !error.contains("Couldn't fetch models"),
+            "double-wrapped: {error}"
+        );
+        assert_eq!(*failure, Some(FetchFailure::StoreUnavailable));
+    }
+
+    /// A transport failure keeps the wrapper it has always had, and its class offers no remedy.
+    #[test]
+    fn connect_still_wraps_a_transport_error() {
+        let mut app = test_app();
+        let nonce = open(
+            &mut app,
+            Modal::Connect(connect_model_list_step(vec![], true)),
+        );
+        app.handle_connect_models(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(FetchFailure::Fetch, "connection refused")),
+        );
+        let Some(ConnectStep::ModelList { error, failure, .. }) = connect_step(&app) else {
+            panic!("expected the model list");
+        };
+        let error = error.as_deref().expect("a failed fetch sets an error");
+        assert!(
+            error.contains("Couldn't fetch models"),
+            "not wrapped: {error}"
+        );
+        assert!(error.contains("connection refused"));
+        assert_eq!(*failure, Some(FetchFailure::Fetch));
+    }
+
     #[test]
     fn handle_connect_models_surfaces_a_fetch_error() {
         let mut app = test_app();
@@ -2298,7 +2413,11 @@ mod tests {
             &mut app,
             Modal::Connect(connect_model_list_step(vec![], true)),
         );
-        app.handle_connect_models(nonce, "openai".to_string(), Err("bad key".to_string()));
+        app.handle_connect_models(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(FetchFailure::Fetch, "bad key")),
+        );
         assert!(matches!(
             connect_step(&app),
             Some(ConnectStep::ModelList {
@@ -2422,6 +2541,51 @@ mod tests {
         assert!(
             screen.contains("Ctrl+R: retry"),
             "a 401 from a proxy or a WAF is not a dead end:\n{screen}"
+        );
+    }
+
+    /// The mirror of the test above for the other credential class the step renders. A store
+    /// failure's message is the composed sentence *plus* the keyring's own text — 111 characters
+    /// here, longer than the 401's 105 — so it hits the same popup-sizing path (#57), and its
+    /// remedy is a different string that nothing rendered until now.
+    #[test]
+    fn the_store_failure_step_renders_its_own_remedy_and_never_offers_key_entry() {
+        let mut app = test_app();
+        app.mode = Mode::Connected;
+        let nonce = open(&mut app, Modal::Models(models_list_step(vec![], true)));
+
+        // The sentence `fetch_model_list` composes for an unreadable store, with a real cause.
+        let cause = "the credential store for openai could not be read: \
+                     org.freedesktop.DBus.Error.NoReply: no session bus available";
+        app.handle_models_fetched(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(FetchFailure::StoreUnavailable, cause)),
+        );
+
+        let screen = render(&mut app, 80, 20);
+        let flat = flatten(&screen);
+        assert!(
+            flat.contains(&flatten(
+                "Unlock the credential store and retry, or set a provider's API key in the environment"
+            )),
+            "the store remedy is clipped:\n{screen}"
+        );
+        assert!(
+            flat.contains(&flatten(cause)),
+            "the cause must be rendered in full, not clipped:\n{screen}"
+        );
+        assert!(
+            !screen.contains("/key"),
+            "/key writes to the store that just failed:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Type a model id"),
+            "typing an id cannot repair an unreadable store:\n{screen}"
+        );
+        assert!(
+            screen.contains("Ctrl+R: retry"),
+            "an unreadable store can be a transient D-Bus blip:\n{screen}"
         );
     }
 
@@ -2825,6 +2989,7 @@ mod tests {
                 selected: 0,
                 fetching: true,
                 error: None,
+                failure: None,
                 from_key: false,
             }),
         );
@@ -2866,13 +3031,14 @@ mod tests {
             Modal::Connect(ConnectStep::ModelList {
                 rows: vec![ProviderRow {
                     id: "openai".to_string(),
-                    connected: true,
+                    key: RowKey::Present,
                 }],
                 provider: "openai".to_string(),
                 models: vec![],
                 selected: 0,
                 fetching: true,
                 error: None,
+                failure: None,
                 from_key: false,
             }),
         );
@@ -3031,6 +3197,7 @@ mod tests {
                 selected: 1,
                 fetching: false,
                 error: None,
+                failure: None,
                 from_key: false,
             }),
         );
@@ -3101,6 +3268,7 @@ mod tests {
                 selected: 0,
                 fetching: true,
                 error: None,
+                failure: None,
                 from_key: true,
             }),
         );
@@ -3136,7 +3304,7 @@ mod tests {
             Modal::Connect(ConnectStep::ProviderList {
                 rows: vec![ProviderRow {
                     id: "local".to_string(),
-                    connected: true,
+                    key: RowKey::Present,
                 }],
                 selected: 0,
             }),
@@ -3302,6 +3470,44 @@ mod tests {
         );
     }
 
+    /// `connect.store_unavailable` already names the provider and the cause, so wrapping it in
+    /// `connect.fetch_error` would read "Couldn't fetch models: the credential store for openai
+    /// could not be read: ...".
+    #[test]
+    fn a_store_failure_message_is_passed_through_unwrapped() {
+        let app = test_app();
+        let err = FetchError {
+            class: FetchFailure::StoreUnavailable,
+            message: "the credential store for openai could not be read: locked".to_string(),
+        };
+        assert_eq!(app.fetch_error_message("openai", &err), err.message);
+    }
+
+    /// The failure routes to the credentials step, carrying the remedy that step renders.
+    #[test]
+    fn handle_models_fetched_routes_a_store_failure_to_the_credentials_step() {
+        let mut app = test_app();
+        // `open` rather than `App::open_modal`: the latter spawns a fetch, and this is a sync
+        // test with no tokio runtime. That is what the `open` helper above exists for.
+        let nonce = open(&mut app, Modal::Models(models_list_step(vec![], true)));
+        app.handle_models_fetched(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(
+                FetchFailure::StoreUnavailable,
+                "the credential store for openai could not be read: locked",
+            )),
+        );
+        let Some(ModelsStep::Credentials { error, class, .. }) = models_step(&app) else {
+            panic!(
+                "a store failure must not offer a model-id box, got {:?}",
+                models_step(&app)
+            );
+        };
+        assert!(error.contains("could not be read"), "{error}");
+        assert_eq!(*class, FetchFailure::StoreUnavailable);
+    }
+
     #[test]
     fn handle_models_fetched_routes_a_rejected_credential_to_the_credentials_step() {
         let mut app = test_app();
@@ -3314,7 +3520,10 @@ mod tests {
                 "HTTP status 401 Unauthorized",
             )),
         );
-        let Some(ModelsStep::Credentials { provider, error }) = models_step(&app) else {
+        let Some(ModelsStep::Credentials {
+            provider, error, ..
+        }) = models_step(&app)
+        else {
             panic!(
                 "a 401 must not offer a model-id box, got {:?}",
                 models_step(&app)
@@ -3336,7 +3545,10 @@ mod tests {
             "openai".to_string(),
             Err(fetch_err(FetchFailure::MissingKey, "No API key for openai")),
         );
-        let Some(ModelsStep::Credentials { provider, error }) = models_step(&app) else {
+        let Some(ModelsStep::Credentials {
+            provider, error, ..
+        }) = models_step(&app)
+        else {
             panic!(
                 "a missing key must not offer a model-id box, got {:?}",
                 models_step(&app)
@@ -3360,6 +3572,7 @@ mod tests {
             Modal::Models(ModelsStep::Credentials {
                 provider: "openai".to_string(),
                 error: "openai rejected the credential".to_string(),
+                class: FetchFailure::Auth,
             }),
         );
         let before = app.modal.nonce();
@@ -3607,6 +3820,112 @@ mod tests {
         assert!(app.settings.models.is_empty());
     }
 
+    /// The headline case from #51: the keyring is already locked when the TUI starts, so
+    /// `rebuild` records the failures, no key resolves, and the provider is offline before
+    /// `/models` is ever opened. The offline step would send the user to `/connect`, which writes
+    /// to the same unreadable store.
+    #[test]
+    fn models_reports_the_store_when_the_offline_fallback_was_its_fault() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.provider_info.store_failures = vec![crate::provider::StoreFailure {
+            provider: "openai".to_string(),
+            error: "no D-Bus session".to_string(),
+        }];
+        app.enter_models();
+        let Some(ModelsStep::Credentials { error, .. }) = models_step(&app) else {
+            panic!("expected the credentials step, got {:?}", models_step(&app));
+        };
+        assert!(
+            error.contains("openai") && error.contains("no D-Bus session"),
+            "{error}"
+        );
+    }
+
+    /// #51's remedy has to survive the render, not just the string. `draw_engine` puts each log
+    /// line in a `ListItem`, and a ratatui `List` truncates rather than wraps, with no ellipsis —
+    /// so round 2's 206-column sentence lost its whole remedy clause at every realistic width
+    /// while a `contains` assertion on the `String` still passed. Assert on the buffer instead.
+    ///
+    /// This drives the real `App::draw` in `Mode::Engine`, so the assertion covers the list the
+    /// user actually sees, borders and all.
+    #[test]
+    fn the_store_offline_remedy_survives_an_80_column_render() {
+        let mut app = test_app();
+        app.mode = Mode::Engine;
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.provider_info.store_failures = vec![crate::provider::StoreFailure {
+            provider: "openai".to_string(),
+            error: "locked".to_string(),
+        }];
+        app.engine_log = app.provider_info.notices(app.config.lang);
+        let screen = render(&mut app, 80, 12);
+        assert!(
+            screen.contains("credential store"),
+            "the cause is not on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("ANTHROPIC_API_KEY"),
+            "the remedy is not on screen:\n{screen}"
+        );
+    }
+
+    /// The headline scenario is *every* entry failing, not one. `store_failures.first()` is then
+    /// always `anthropic`, so a DeepSeek user read a sentence about Anthropic; the active provider
+    /// is `local` when the fallback has already happened, so it is not a name to substitute in
+    /// either. Nothing on the step may name a provider the user never chose.
+    #[test]
+    fn models_names_no_provider_when_the_whole_store_failed() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.provider_info.store_failures = crate::selection::REMOTE_IDS
+            .iter()
+            .map(|id| crate::provider::StoreFailure {
+                provider: id.to_string(),
+                error: "locked".to_string(),
+            })
+            .collect();
+        app.enter_models();
+        let Some(ModelsStep::Credentials { error, .. }) = models_step(&app) else {
+            panic!("expected the credentials step, got {:?}", models_step(&app));
+        };
+        assert!(error.contains("locked"), "{error}");
+        for id in crate::selection::REMOTE_IDS.iter().chain(["local"].iter()) {
+            assert!(!error.contains(id), "the message names {id}: {error}");
+        }
+        app.mode = Mode::Connected;
+        let screen = render(&mut app, 80, 24);
+        for id in crate::selection::REMOTE_IDS.iter().chain(["local"].iter()) {
+            assert!(!screen.contains(id), "the render names {id}:\n{screen}");
+        }
+    }
+
+    /// A rejected `*_BASE_URL` is its own cause. Telling the user to unlock the credential store
+    /// is advice that cannot work, and `ProviderInfo::notices` was hardened against exactly this
+    /// ten lines away — `store_caused_offline` is why both now answer the question the same way.
+    #[test]
+    fn models_does_not_blame_the_store_for_another_offline_reason() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::BaseUrlRejected {
+            var: "LIGHT_OPENAI_BASE_URL".to_string(),
+        });
+        app.provider_info.store_failures = vec![crate::provider::StoreFailure {
+            provider: "openai".to_string(),
+            error: "locked".to_string(),
+        }];
+        app.enter_models();
+        assert_eq!(models_step(&app), Some(&ModelsStep::Offline));
+    }
+
+    /// Offline for a reason that is not the store still gets the plain offline step.
+    #[test]
+    fn models_still_reports_offline_when_no_store_failed() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.enter_models();
+        assert!(matches!(models_step(&app), Some(ModelsStep::Offline)));
+    }
+
     #[test]
     fn handle_connect_key_blank_key_stays_on_key_entry() {
         let mut app = test_app();
@@ -3625,9 +3944,54 @@ mod tests {
         ));
     }
 
+    /// Wire the `Unavailable` arm to `provider.key.keyring` and the old negative assertion still
+    /// passed — `/key` would report a live keyring for a dead one. `ollama` declares no env var, so
+    /// `process_env` cannot decide this and the assertion can be strict.
+    #[test]
+    fn an_unreadable_store_is_labelled_unavailable() {
+        let app = test_app_with_store(Arc::new(
+            light_factory_tui::credentials::FailingStore::default(),
+        ));
+        assert_eq!(
+            app.key_status_label("ollama"),
+            app.t("provider.key.unavailable")
+        );
+    }
+
+    /// Map `Unavailable` to `Present` and the old negative assertion still passed — the row would
+    /// read "openai (connected)" for a store that cannot be read, which is worse than the bug this
+    /// fixes. `openai` stays a negative because the ambient env can make its row `Present`, and
+    /// `ollama` — the only keyless row in `PROVIDER_NAMES` — takes the special case above rather
+    /// than the mapping, so the strict `KeyStatus::Unavailable` assertion still lives in
+    /// `selection.rs`'s `key_status_with_classifies_every_wiring_outcome`.
+    #[test]
+    fn provider_rows_report_an_unreadable_store() {
+        let app = test_app_with_store(Arc::new(
+            light_factory_tui::credentials::FailingStore::default(),
+        ));
+        let rows = app.build_provider_rows();
+        let openai = rows.iter().find(|r| r.id == "openai").expect("listed");
+        assert_ne!(openai.key, RowKey::Absent);
+
+        // Ollama takes no API key, so a broken store must never label it "key store unavailable" —
+        // the special case in `build_provider_rows` had no test at all.
+        let ollama = rows.iter().find(|r| r.id == "ollama").expect("listed");
+        assert_ne!(ollama.key, RowKey::Unavailable);
+    }
+
+    #[test]
+    fn provider_rows_report_a_stored_key_as_present() {
+        let store = MemStore::new();
+        store.set("openai", "sk-ring").unwrap();
+        let app = test_app_with_store(Arc::new(store));
+        let rows = app.build_provider_rows();
+        let openai = rows.iter().find(|r| r.id == "openai").expect("listed");
+        assert_eq!(openai.key, RowKey::Present);
+    }
+
     #[test]
     fn handle_connect_key_keyring_failure_sets_error_and_stays() {
-        let mut app = test_app_with_store(Arc::new(FailingStore));
+        let mut app = test_app_with_store(Arc::new(SetFailsStore));
         open(
             &mut app,
             Modal::Connect(ConnectStep::KeyEntry {

@@ -118,15 +118,31 @@ const EN: Catalog = &[
     ),
     (
         "provider.offline.nothing",
-        "No provider configured — set ANTHROPIC_API_KEY (or another provider's key) or LIGHT_OLLAMA=1",
+        "No provider key — set ANTHROPIC_API_KEY or LIGHT_OLLAMA=1",
     ),
     (
         "provider.offline.missing_key",
-        "Provider '{selector}' selected but {key} is not set — falling back to offline",
+        "Provider '{selector}': {key} is not set — offline",
     ),
     (
         "provider.offline.base_url",
         "{var} was rejected — falling back to offline",
+    ),
+    (
+        "provider.store.unavailable",
+        "Could not read the stored key for {provider}: {error}",
+    ),
+    (
+        "provider.store.unavailable_all",
+        "Could not read the credential store: {error}",
+    ),
+    (
+        "provider.offline.store_unavailable",
+        "Offline: the credential store could not be read.",
+    ),
+    (
+        "provider.offline.store_remedy",
+        "Unlock it and restart, or set ANTHROPIC_API_KEY.",
     ),
     ("status.ask_empty", "Usage: /ask <prompt>"),
     (
@@ -189,6 +205,7 @@ const EN: Catalog = &[
     ("provider.key.env", "env"),
     ("provider.key.keyring", "keyring"),
     ("provider.key.none", "none"),
+    ("provider.key.unavailable", "unavailable"),
     ("key.list", "keys: {list}"),
     ("status.model_set", "Model set to {model}"),
     (
@@ -264,6 +281,7 @@ const EN: Catalog = &[
     ("connect.title", "Connect a provider"),
     ("connect.key_heading", "API Key"),
     ("connect.connected", "connected"),
+    ("connect.store_unavailable_row", "key store unavailable"),
     ("connect.models_heading", "Models: {provider}"),
     ("connect.fetching", "Fetching models..."),
     ("connect.fetch_error", "Couldn't fetch models: {error}"),
@@ -280,6 +298,10 @@ const EN: Catalog = &[
     ("connect.footer_models", "Enter: select · Esc: back"),
     ("connect.footer_fetching", "Esc: cancel"),
     ("connect.no_key", "No API key for {provider}"),
+    (
+        "connect.store_unavailable",
+        "the credential store for {provider} could not be read: {error}",
+    ),
     ("models.title", "Select a model"),
     ("models.offline", "Use /connect to connect a provider first"),
     (
@@ -297,6 +319,10 @@ const EN: Catalog = &[
     (
         "models.credentials_remedy",
         "Use /connect, /key {provider}, or /model <id>",
+    ),
+    (
+        "models.store_remedy",
+        "Unlock the credential store and retry, or set a provider's API key in the environment",
     ),
     (
         "models.footer_list",
@@ -412,15 +438,31 @@ const ES: Catalog = &[
     ),
     (
         "provider.offline.nothing",
-        "No hay proveedor configurado — define ANTHROPIC_API_KEY (o la clave de otro proveedor) o LIGHT_OLLAMA=1",
+        "Sin proveedor — define ANTHROPIC_API_KEY o LIGHT_OLLAMA=1",
     ),
     (
         "provider.offline.missing_key",
-        "Proveedor '{selector}' seleccionado pero {key} no está definida — usando modo sin conexión",
+        "Proveedor '{selector}': falta {key} — sin conexión",
     ),
     (
         "provider.offline.base_url",
         "{var} fue rechazada — usando modo sin conexión",
+    ),
+    (
+        "provider.store.unavailable",
+        "No se pudo leer la clave guardada de {provider}: {error}",
+    ),
+    (
+        "provider.store.unavailable_all",
+        "No se pudo leer el almac\u{e9}n de credenciales: {error}",
+    ),
+    (
+        "provider.offline.store_unavailable",
+        "Sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales.",
+    ),
+    (
+        "provider.offline.store_remedy",
+        "Desbloqu\u{e9}alo y reinicia, o define ANTHROPIC_API_KEY.",
     ),
     ("status.ask_empty", "Uso: /ask <indicación>"),
     (
@@ -498,6 +540,7 @@ const ES: Catalog = &[
     ("provider.key.env", "entorno"),
     ("provider.key.keyring", "llavero"),
     ("provider.key.none", "ninguna"),
+    ("provider.key.unavailable", "no disponible"),
     ("key.list", "claves: {list}"),
     ("status.model_set", "Modelo cambiado a {model}"),
     (
@@ -582,6 +625,10 @@ const ES: Catalog = &[
     ("connect.title", "Conectar un proveedor"),
     ("connect.key_heading", "Clave de API"),
     ("connect.connected", "conectado"),
+    (
+        "connect.store_unavailable_row",
+        "almac\u{e9}n de claves no disponible",
+    ),
     ("connect.models_heading", "Modelos: {provider}"),
     ("connect.fetching", "Obteniendo modelos..."),
     (
@@ -601,6 +648,10 @@ const ES: Catalog = &[
     ("connect.footer_models", "Enter: elegir · Esc: volver"),
     ("connect.footer_fetching", "Esc: cancelar"),
     ("connect.no_key", "No hay clave de API para {provider}"),
+    (
+        "connect.store_unavailable",
+        "no se pudo leer el almac\u{e9}n de credenciales de {provider}: {error}",
+    ),
     ("models.title", "Seleccionar un modelo"),
     (
         "models.offline",
@@ -621,6 +672,10 @@ const ES: Catalog = &[
     (
         "models.credentials_remedy",
         "Usa /connect, /key {provider}, o /model <id>",
+    ),
+    (
+        "models.store_remedy",
+        "Desbloquea el almac\u{e9}n de credenciales y reintenta, o define la clave de API de un proveedor en el entorno",
     ),
     (
         "models.footer_list",
@@ -724,11 +779,56 @@ mod tests {
     /// because every render assertion runs in EN.
     #[test]
     fn every_footer_fits_the_popup_in_both_locales() {
-        // `draw_popup` draws a 60-column box with a one-column border on each side.
+        // `modal.rs`'s `draw_popup` draws a 60-column box with a one-column border on each side.
         const INNER_WIDTH: usize = 58;
         for (catalog, name) in [(EN, "EN"), (ES, "ES")] {
             for (key, value) in catalog {
                 if !key.contains(".footer") {
+                    continue;
+                }
+                let columns = value.chars().count();
+                assert!(
+                    columns <= INNER_WIDTH,
+                    "{name} {key} is {columns} columns; it is truncated at {INNER_WIDTH}: {value}"
+                );
+            }
+        }
+    }
+
+    /// The connect modal's provider rows share the footers' popup, but
+    /// `every_footer_fits_the_popup_in_both_locales` gates `*.footer` keys only. `anthropic` is
+    /// the longest id in `PROVIDER_NAMES`, duplicated by hand from `app.rs` because this crate's
+    /// modules are private to the binary; the row is drawn as `"> {id} ({suffix})"`.
+    #[test]
+    fn the_unavailable_row_suffix_fits_the_popup_in_both_locales() {
+        // Same 58 columns as above, and from the same source: `draw_popup`'s 60-column box.
+        const INNER_WIDTH: usize = 58;
+        for (locale, name) in [(Locale::En, "EN"), (Locale::Es, "ES")] {
+            let row = format!(
+                "> anthropic ({})",
+                t(locale, "connect.store_unavailable_row")
+            );
+            let columns = row.chars().count();
+            assert!(
+                columns <= INNER_WIDTH,
+                "{name} row is {columns} columns: {row}"
+            );
+        }
+    }
+
+    /// `draw_engine` renders every `ProviderInfo::notices` line as a `ListItem` in a ratatui
+    /// `List`, which **truncates** rather than wraps — a long line loses its tail with no
+    /// ellipsis, and the tail is where the remedy is. `every_footer_fits_the_popup_in_both_locales`
+    /// gates `*.footer` only; these keys need the same guard for a different surface.
+    #[test]
+    fn every_provider_notice_fits_its_surfaces_in_both_locales() {
+        // The same 58 columns as the footer gate, and for the same reason: these keys also reach
+        // `draw_popup`'s 60-column box (`models_view` renders `offline_notice` there), which is
+        // narrower than `draw_engine`'s list at any usable terminal width. Budget for the narrower.
+        const INNER_WIDTH: usize = 58;
+        for (catalog, name) in [(EN, "EN"), (ES, "ES")] {
+            for (key, value) in catalog {
+                if !(key.starts_with("provider.offline.") || key.starts_with("provider.store.")) {
                     continue;
                 }
                 let columns = value.chars().count();

@@ -84,6 +84,48 @@ impl CredentialStore for MemStore {
     }
 }
 
+/// A store whose every operation fails, for the store-failure branch [`MemStore`] cannot reach.
+///
+/// It models a keyring that is present but unusable — a locked wallet, a dead D-Bus session —
+/// which fails for every operation rather than for one, so `set` and `delete` fail too.
+///
+/// `#[doc(hidden)] pub` for the same reason as [`MemStore`]: `selection.rs`, `modal.rs`, and
+/// `app.rs` live in the binary crate and can only reach a double this library exports.
+#[doc(hidden)]
+pub struct FailingStore {
+    message: String,
+}
+
+impl FailingStore {
+    /// A store that fails with `message`, so a test can assert that the store's own words reach
+    /// the user.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Default for FailingStore {
+    fn default() -> Self {
+        Self::new("credential store unavailable")
+    }
+}
+
+impl CredentialStore for FailingStore {
+    fn get(&self, _provider: &str) -> anyhow::Result<Option<String>> {
+        Err(anyhow::anyhow!("{}", self.message))
+    }
+
+    fn set(&self, _provider: &str, _key: &str) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("{}", self.message))
+    }
+
+    fn delete(&self, _provider: &str) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("{}", self.message))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +152,32 @@ mod tests {
         store.set("gemini", "first").unwrap();
         store.set("gemini", "second").unwrap();
         assert_eq!(store.get("gemini").unwrap(), Some("second".to_string()));
+    }
+
+    /// `MemStore` always answers `Ok`, so no test could reach the `Err` branch that
+    /// `CredentialStore::get`'s contract makes load-bearing. This double is that branch.
+    #[test]
+    fn failing_store_fails_every_operation() {
+        let store = FailingStore::default();
+        assert!(store.get("openai").is_err());
+        assert!(store.set("openai", "sk-test").is_err());
+        assert!(store.delete("openai").is_err());
+    }
+
+    /// The store's own words are what the user ends up reading, so a test must be able to pin
+    /// them.
+    #[test]
+    fn failing_store_reports_the_message_it_was_given() {
+        let store = FailingStore::new("no D-Bus session");
+        let err = store.get("openai").expect_err("get must fail");
+        assert_eq!(format!("{err:#}"), "no D-Bus session");
+    }
+
+    #[test]
+    fn failing_store_default_names_the_store() {
+        let err = FailingStore::default()
+            .get("openai")
+            .expect_err("get must fail");
+        assert_eq!(format!("{err:#}"), "credential store unavailable");
     }
 }

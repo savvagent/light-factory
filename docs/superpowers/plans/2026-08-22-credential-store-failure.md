@@ -1,0 +1,2838 @@
+# Credential Store Failure vs. Absence — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Keep "the credential store could not be read" distinct from "no key is stored" at every
+TUI call site, so a locked keyring stops being reported as "No API key for openai".
+
+**Architecture:** `CredentialStore::get` already returns `anyhow::Result<Option<String>>` — three
+states. `crates/tui/src/selection.rs` collapses them to two with `.ok().flatten()`. Replace the
+`sources_with`/`classify`/`resolve_key_from` trio with two shared primitives (`env_key`,
+`read_store`), widen `KeyStatus` with `Unavailable`, and give `resolve_key` a three-state
+`KeyResolution` return. The new state then propagates to the four consumers: the `/models` fetch
+(a new `FetchFailure::StoreUnavailable` class with its own remedy), the `/key` listing label, the
+`/connect` provider rows (`ProviderRow.connected: bool` becomes a tri-state `RowKey`), and the
+engine-pane offline notice (`ProviderInfo` gains `store_failures`).
+
+**Tech Stack:** Rust edition 2024, toolchain pinned by `rust-toolchain.toml`; `anyhow`, `ratatui`,
+`crossterm`, the existing `CredentialStore`/`MemStore` seam and the `light_factory_providers`
+selection layer.
+
+**Spec:** `docs/superpowers/specs/2026-08-22-credential-store-failure-design.md` — read it first.
+This plan implements it exactly.
+
+**Source:** GitHub issue savvagent/light-factory#51.
+
+## Global Constraints
+
+- **No AI/self-attribution anywhere** — no `Co-Authored-By`, no "Generated with", no `🤖`, in
+  commits, PR bodies, code comments, or docs.
+- **`cargo fmt --all` before every Rust commit.** rustfmt is pinned in `rust-toolchain.toml`.
+- **Every task ends green:** `cargo test -p light-factory-tui` and
+  `cargo clippy --workspace --all-targets -- -D warnings` both clean before the commit.
+- **Tests live next to the code** in `#[cfg(test)] mod tests` at the bottom of the file. There is
+  no `tests/` directory in `crates/tui`.
+- **Every new user-facing string is added to BOTH catalogs** in `crates/tui/src/i18n.rs` (`EN` and
+  `ES`). `i18n::tests::es_mirrors_en_exactly` fails otherwise. Add the EN entry and the ES entry in
+  the same step.
+- **Secrets never reach logs or `Debug` output.** `KeyResolution::Found` holds a live API key; it
+  gets a hand-written redacting `Debug` (Task 3).
+- **Dependency flow is inward.** Nothing in this change touches `crates/providers`; the credential
+  store is a TUI concept, so `OfflineReason` gains no variant.
+- **No `Cargo.toml` version bump.** `crates/tui/src/lib.rs` exposes only `credentials`,
+  `engine_view`, and `i18n`; `selection.rs`, `modal.rs`, `app.rs`, `provider.rs`, and the new
+  `text.rs` are binary-crate-internal. The library-surface changes are the additive `FailingStore`
+  and the new `i18n` catalog entries — both additive, both semver-minor.
+- **No out-of-band surfaces are touched.** No `Dockerfile`/`fly.toml`, no `web/`, no
+  `crates/persistence/migrations/`.
+
+## File Structure
+
+| File | Responsibility |
+|---|---|
+| Create. `crates/tui/src/text.rs` | `one_line` / `truncate_chars` text-hygiene helpers shared by the resolution seam and the modal |
+| Modify. `crates/tui/src/main.rs` | `mod text;` declaration |
+| Modify. `crates/tui/src/credentials.rs` | `FailingStore` test double whose every operation returns `Err` |
+| Modify. `crates/tui/src/selection.rs` | `env_key` / `read_store` primitives, `KeyStatus::Unavailable`, `KeyResolution`, store failures out of `build_selection` |
+| Modify. `crates/tui/src/modal.rs` | `FetchFailure::StoreUnavailable`, `ModelsStep::Credentials { remedy }`, `ProviderRow`/`RowKey`, row rendering and Enter routing, `fetch_model_list_inner` |
+| Modify. `crates/tui/src/app.rs` | `fetch_error_message` arm, `credentials_remedy`, `key_status_label` arm, `build_provider_rows`, `enter_engine` notice assembly |
+| Modify. `crates/tui/src/provider.rs` | `StoreFailure`, `ProviderInfo.store_failures`, `ProviderInfo::notices` |
+| Modify. `crates/tui/src/i18n.rs` | Six new EN + ES strings and a popup-width test for the new row suffix |
+| Create. `docs/superpowers/plans/2026-08-22-credential-store-failure.md` | This plan |
+
+## Task Order & Rationale
+
+1. **Text helpers first** (Task 1) because both the resolution seam and the modal need them, and
+   extracting them from `summarize_provider_error` is a behaviour-preserving refactor that is
+   easiest to verify while nothing else has moved.
+2. **The test double next** (Task 2) because every later task's failing test needs a store that
+   returns `Err`, and it cannot be written before the double exists.
+3. **The `/models` failure class** (Task 3) before anything produces it, so the class, its message,
+   and its remedy can be reviewed on their own against a hand-built `FetchError`.
+4. **The resolution seam** (Task 4) then makes a real unreadable store produce that class, and
+   fixes the `/key` label at the same time — both are `key_status`/`resolve_key` consumers.
+5. **The `/connect` rows** (Task 5) is the last `key_status` consumer and the only one that needs a
+   type change (`bool` → `RowKey`), so it lands after the seam it reads from is settled.
+6. **The offline notice** (Task 6) is the startup path (`build_selection`/`rebuild`), independent
+   of the modal work, and ends the change with the third acceptance criterion.
+
+---
+
+### Task 1: Extract the text-hygiene helpers into `crates/tui/src/text.rs`
+
+**Files:**
+- Create: `crates/tui/src/text.rs`
+- Modify: `crates/tui/src/main.rs` (add `mod text;` to the module list at lines 3-12)
+- Modify: `crates/tui/src/modal.rs` (`summarize_provider_error`, lines 608-622)
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: `pub(crate) fn one_line(s: &str) -> String` and
+  `pub(crate) fn truncate_chars(s: &str, max: usize) -> String` in `crate::text`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `crates/tui/src/text.rs` containing only the test module for now:
+
+```rust
+//! Text-hygiene helpers for the code paths that render foreign error text.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_line_keeps_only_the_first_line() {
+        assert_eq!(one_line("first\nsecond\nthird"), "first");
+        assert_eq!(one_line("only"), "only");
+        assert_eq!(one_line(""), "");
+    }
+
+    /// Error text is written into a terminal cell verbatim; a raw `ESC` in a cell is an
+    /// escape-sequence injection, and a tab or a carriage return corrupts the row.
+    #[test]
+    fn one_line_strips_control_characters() {
+        assert_eq!(one_line("a\u{1b}[31mb\tc"), "a[31mbc");
+        assert_eq!(one_line("a\rb"), "ab");
+    }
+
+    /// `str::lines` treats `\r\n` as one terminator, so a message that opens with a blank line
+    /// yields an empty first line. That is the pre-existing `summarize_provider_error` behaviour
+    /// and this refactor must preserve it — changing it would be a behaviour change wearing a
+    /// refactor's clothes.
+    #[test]
+    fn one_line_does_not_skip_a_leading_blank_line() {
+        assert_eq!(one_line("\r\nafter"), "");
+        assert_eq!(one_line("\nafter"), "");
+    }
+
+    #[test]
+    fn one_line_trims_the_ends() {
+        assert_eq!(one_line("   padded   \nnext"), "padded");
+    }
+
+    #[test]
+    fn truncate_chars_leaves_a_short_string_alone() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("exactly10!", 10), "exactly10!");
+    }
+
+    #[test]
+    fn truncate_chars_appends_an_ellipsis_when_it_cuts() {
+        assert_eq!(truncate_chars("abcdef", 3), "abc\u{2026}");
+    }
+
+    /// Counting characters rather than bytes is what keeps a multi-byte message from panicking
+    /// on a split boundary — `&s[..max]` would.
+    #[test]
+    fn truncate_chars_counts_characters_not_bytes() {
+        assert_eq!(truncate_chars("ñññññ", 2), "ññ\u{2026}");
+        assert_eq!(truncate_chars("ñññ", 3), "ñññ");
+    }
+}
+```
+
+Add `mod text;` to `crates/tui/src/main.rs`, keeping the list alphabetical (between `mod
+settings;` and `mod ws;`).
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p light-factory-tui text::`
+Expected: FAIL to compile — `cannot find function 'one_line' in this scope` (and the same for
+`truncate_chars`).
+
+- [ ] **Step 3: Write the implementation**
+
+Insert above the test module in `crates/tui/src/text.rs`:
+
+```rust
+/// The first line of `s`, with control characters removed and the ends trimmed.
+///
+/// Error text from a provider or from the OS credential store reaches a terminal cell verbatim.
+/// A raw `ESC` in a cell is an escape-sequence injection, and a newline turns a one-row field
+/// into an unbounded block that pushes the modal's own trusted rows off the screen.
+pub(crate) fn one_line(s: &str) -> String {
+    s.lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// `s` capped at `max` characters, with a trailing ellipsis when it was cut.
+///
+/// Characters, not bytes: slicing a multi-byte message at a byte offset panics.
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!("{kept}\u{2026}")
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p light-factory-tui text::`
+Expected: PASS, 7 tests.
+
+- [ ] **Step 5: Reduce `summarize_provider_error` to a composition of the two helpers**
+
+In `crates/tui/src/modal.rs`, replace the body of `summarize_provider_error` (lines 608-622) with:
+
+```rust
+fn summarize_provider_error(message: &str) -> String {
+    crate::text::truncate_chars(&crate::text::one_line(message), PROVIDER_ERROR_MAX_CHARS)
+}
+```
+
+Leave the function's doc comment exactly as it is — it explains *why* the cap exists, which is
+still true — and append one sentence: `The two rules it composes live in [`crate::text`] so the
+credential-store path can share them.`
+
+- [ ] **Step 6: Run the existing modal tests to verify the refactor changed nothing**
+
+Run: `cargo test -p light-factory-tui modal::`
+Expected: PASS — in particular `a_provider_error_is_reduced_to_one_bounded_line` and every other
+pre-existing modal test, unchanged.
+
+- [ ] **Step 7: Run the whole crate, clippy, and commit**
+
+```bash
+cargo test -p light-factory-tui
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+git add crates/tui/src/text.rs crates/tui/src/main.rs crates/tui/src/modal.rs
+git commit -m "tui: extract the one-line and truncate text helpers into their own module"
+```
+
+Expected: all green; clippy clean.
+
+---
+
+### Task 2: Add the `FailingStore` test double
+
+**Files:**
+- Modify: `crates/tui/src/credentials.rs` (add after `MemStore`'s impl, before `mod tests`)
+
+**Interfaces:**
+- Consumes: the existing `CredentialStore` trait.
+- Produces: `light_factory_tui::credentials::FailingStore`, with
+  `FailingStore::new(message: impl Into<String>) -> Self` and
+  `impl Default for FailingStore` (message `"credential store unavailable"`). All three trait
+  methods return `Err`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `crates/tui/src/credentials.rs`'s `mod tests`:
+
+```rust
+    /// `MemStore` always answers `Ok`, so no test could reach the `Err` branch that
+    /// `CredentialStore::get`'s contract makes load-bearing. This double is that branch.
+    #[test]
+    fn failing_store_fails_every_operation() {
+        let store = FailingStore::default();
+        assert!(store.get("openai").is_err());
+        assert!(store.set("openai", "sk-test").is_err());
+        assert!(store.delete("openai").is_err());
+    }
+
+    /// The store's own words are what the user ends up reading, so a test must be able to pin
+    /// them.
+    #[test]
+    fn failing_store_reports_the_message_it_was_given() {
+        let store = FailingStore::new("no D-Bus session");
+        let err = store.get("openai").expect_err("get must fail");
+        assert_eq!(format!("{err:#}"), "no D-Bus session");
+    }
+
+    #[test]
+    fn failing_store_default_names_the_store() {
+        let err = FailingStore::default()
+            .get("openai")
+            .expect_err("get must fail");
+        assert_eq!(format!("{err:#}"), "credential store unavailable");
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p light-factory-tui credentials::`
+Expected: FAIL to compile — `cannot find type 'FailingStore' in this scope`.
+
+- [ ] **Step 3: Write the implementation**
+
+Insert into `crates/tui/src/credentials.rs`, after `impl CredentialStore for MemStore` and before
+`#[cfg(test)]`:
+
+```rust
+/// A store whose every operation fails, for the store-failure branch [`MemStore`] cannot reach.
+///
+/// It models a keyring that is present but unusable — a locked wallet, a dead D-Bus session —
+/// which fails for every operation rather than for one, so `set` and `delete` fail too.
+///
+/// `#[doc(hidden)] pub` for the same reason as [`MemStore`]: `selection.rs`, `modal.rs`, and
+/// `app.rs` live in the binary crate and can only reach a double this library exports.
+#[doc(hidden)]
+pub struct FailingStore {
+    message: String,
+}
+
+impl FailingStore {
+    /// A store that fails with `message`, so a test can assert that the store's own words reach
+    /// the user.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Default for FailingStore {
+    fn default() -> Self {
+        Self::new("credential store unavailable")
+    }
+}
+
+impl CredentialStore for FailingStore {
+    fn get(&self, _provider: &str) -> anyhow::Result<Option<String>> {
+        Err(anyhow::anyhow!("{}", self.message))
+    }
+
+    fn set(&self, _provider: &str, _key: &str) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("{}", self.message))
+    }
+
+    fn delete(&self, _provider: &str) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("{}", self.message))
+    }
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p light-factory-tui credentials::`
+Expected: PASS — the three new tests plus the three pre-existing `MemStore` tests.
+
+- [ ] **Step 5: Run the whole crate, clippy, and commit**
+
+```bash
+cargo test -p light-factory-tui
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+git add crates/tui/src/credentials.rs
+git commit -m "tui: add a credential store double whose operations fail"
+```
+
+Expected: all green; clippy clean.
+
+---
+
+### Task 3: Add the `StoreUnavailable` fetch class and its own remedy
+
+**Files:**
+- Modify: `crates/tui/src/modal.rs` (`FetchFailure` at lines 143-149, `needs_credentials` at
+  152-157, `ModelsStep::Credentials` at 130-133, the `Credentials` render arm at 1135-1157, and
+  the `Credentials` constructions in `mod tests`)
+- Modify: `crates/tui/src/app.rs` (`fetch_error_message` at lines 864-873, `handle_models_fetched`'s
+  `Credentials` construction at 845-851)
+- Modify: `crates/tui/src/i18n.rs` (`connect.store_unavailable`, `models.store_remedy`, EN + ES)
+
+**Interfaces:**
+- Consumes: `crate::text` (Task 1) indirectly, via `summarize_provider_error`.
+- Produces: `FetchFailure::StoreUnavailable`; `ModelsStep::Credentials { provider, error, remedy }`;
+  `App::credentials_remedy(&self, provider: &str, class: FetchFailure) -> String`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `crates/tui/src/modal.rs`'s `mod tests`:
+
+```rust
+    /// A store failure is a credential-class failure: no model id repairs a credential store, so
+    /// the modal must show the remedy step rather than the manual-entry step.
+    #[test]
+    fn a_store_failure_needs_credentials() {
+        assert!(FetchFailure::StoreUnavailable.needs_credentials());
+        assert!(FetchFailure::MissingKey.needs_credentials());
+        assert!(FetchFailure::Auth.needs_credentials());
+        assert!(!FetchFailure::Fetch.needs_credentials());
+    }
+```
+
+Add to `crates/tui/src/app.rs`'s `mod tests`:
+
+```rust
+    /// `/connect` and `/key` both write to the credential store, so neither is a remedy for a
+    /// store that cannot be read. The remedy line must differ from the one the other credential
+    /// classes get.
+    #[test]
+    fn a_store_failure_gets_its_own_remedy() {
+        let app = test_app();
+        let store = app.credentials_remedy("openai", FetchFailure::StoreUnavailable);
+        let missing = app.credentials_remedy("openai", FetchFailure::MissingKey);
+        assert_ne!(store, missing);
+        assert!(!store.is_empty(), "every class must produce a remedy");
+        assert!(
+            !store.contains("/key") && !store.contains("/connect"),
+            "the store remedy must not point at commands that write to the broken store: {store}"
+        );
+        assert!(store.contains("openai"), "the remedy names the provider: {store}");
+    }
+
+    /// Every credential class must produce a non-empty remedy, so a future class cannot render an
+    /// empty row.
+    #[test]
+    fn every_credential_class_has_a_remedy() {
+        let app = test_app();
+        for class in [
+            FetchFailure::MissingKey,
+            FetchFailure::Auth,
+            FetchFailure::StoreUnavailable,
+        ] {
+            assert!(
+                !app.credentials_remedy("openai", class).is_empty(),
+                "{class:?} has no remedy"
+            );
+        }
+    }
+
+    /// `connect.store_unavailable` already names the provider and the cause, so wrapping it in
+    /// `connect.fetch_error` would read "Couldn't fetch models: the credential store for openai
+    /// could not be read: ...".
+    #[test]
+    fn a_store_failure_message_is_passed_through_unwrapped() {
+        let app = test_app();
+        let err = FetchError {
+            class: FetchFailure::StoreUnavailable,
+            message: "the credential store for openai could not be read: locked".to_string(),
+        };
+        assert_eq!(app.fetch_error_message("openai", &err), err.message);
+    }
+
+    /// The failure routes to the credentials step, carrying the remedy that step renders.
+    #[test]
+    fn handle_models_fetched_routes_a_store_failure_to_the_credentials_step() {
+        let mut app = test_app();
+        // `open` rather than `App::open_modal`: the latter spawns a fetch, and this is a sync
+        // test with no tokio runtime. The helper exists at app.rs:2147 for exactly this.
+        let nonce = open(&mut app, Modal::Models(models_list_step(vec![], true)));
+        app.handle_models_fetched(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(
+                FetchFailure::StoreUnavailable,
+                "the credential store for openai could not be read: locked",
+            )),
+        );
+        let Some(ModelsStep::Credentials { error, remedy, .. }) = models_step(&app) else {
+            panic!(
+                "a store failure must not offer a model-id box, got {:?}",
+                models_step(&app)
+            );
+        };
+        assert!(error.contains("could not be read"), "{error}");
+        assert!(!remedy.contains("/key"), "{remedy}");
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p light-factory-tui`
+Expected: FAIL to compile — `no variant named 'StoreUnavailable' found for enum 'FetchFailure'`
+and `no method named 'credentials_remedy'`. (Run the whole crate rather than a name filter: the
+five new tests do not share a substring.)
+
+- [ ] **Step 3: Add the variant and widen `needs_credentials`**
+
+In `crates/tui/src/modal.rs`, add to `FetchFailure`:
+
+```rust
+    /// The credential store could not be read, so whether a key exists is unknown. Distinct from
+    /// [`FetchFailure::MissingKey`]: the remedy for a missing key is to store one, which is not a
+    /// remedy for a store that cannot be read.
+    StoreUnavailable,
+```
+
+and widen `needs_credentials`:
+
+```rust
+    pub(crate) fn needs_credentials(self) -> bool {
+        matches!(
+            self,
+            FetchFailure::MissingKey | FetchFailure::Auth | FetchFailure::StoreUnavailable
+        )
+    }
+```
+
+- [ ] **Step 4: Give `ModelsStep::Credentials` a `remedy` field**
+
+In `crates/tui/src/modal.rs`, change the variant (lines 130-133) to:
+
+```rust
+    /// A credential-class fetch failure (no key resolved, the provider refused the one we sent,
+    /// or the credential store could not be read). Typing a model id cannot repair a credential,
+    /// so this step shows a remedy and takes no input.
+    ///
+    /// `remedy` is already localized and already class-specific: `/connect` and `/key` are the
+    /// answer to a missing or rejected key, and are useless against a store that cannot be read,
+    /// so the step carries the sentence rather than deriving it at render time. That keeps the
+    /// render a pure function of the step, as every other arm is.
+    Credentials {
+        provider: String,
+        error: String,
+        remedy: String,
+    },
+```
+
+Change the render arm (lines 1135-1157) so it uses the carried remedy in place of the
+`models.credentials_remedy` lookup:
+
+```rust
+        ModelsStep::Credentials {
+            error, remedy, ..
+        } => {
+            lines.push(Line::from(Span::styled(
+                i18n::t(ctx.locale, "models.credentials_hint"),
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                remedy.clone(),
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                error.clone(),
+                Style::default().fg(Color::Red),
+            )));
+            // A 401/403 is not always about the key — a corporate proxy, a WAF, or an IP
+            // allowlist produces the same status — and a store failure can be a transient D-Bus
+            // blip, so the step keeps a retry rather than dead-ending on a remedy.
+            footer = i18n::t(ctx.locale, "models.footer_retry");
+        }
+```
+
+The `provider` binding is no longer read in this arm; keep it out of the pattern with `..` as
+shown. `models_step_next`'s `Credentials` arm (line 738) still binds `provider` and is unchanged.
+
+Fix every `ModelsStep::Credentials` site the compiler now rejects. Do not change what any of these
+tests assert:
+
+- `modal.rs` `mod tests`, constructions at lines 1863, 1902, 2214, 2397, 2434 — add
+  `remedy: "remedy".to_string(),`.
+- `app.rs` `mod tests`, **destructuring patterns** at lines 3317 and 3339
+  (`let Some(ModelsStep::Credentials { provider, error }) = models_step(&app)`) — add `..` so they
+  read `ModelsStep::Credentials { provider, error, .. }`.
+- `app.rs` `mod tests`, the **construction** at line 3360 inside
+  `retry_re_triggers_the_fetch_from_the_credentials_step` — add
+  `remedy: "remedy".to_string(),`.
+
+- [ ] **Step 5: Add the EN and ES strings**
+
+In `crates/tui/src/i18n.rs`, add to `EN` next to `connect.no_key` (line 282):
+
+```rust
+    (
+        "connect.store_unavailable",
+        "the credential store for {provider} could not be read: {error}",
+    ),
+```
+
+and next to `models.credentials_remedy` (line 298):
+
+```rust
+    (
+        "models.store_remedy",
+        "Unlock the credential store and retry, or set {provider}'s API key in the environment",
+    ),
+```
+
+Add to `ES` at the mirrored positions:
+
+```rust
+    (
+        "connect.store_unavailable",
+        "no se pudo leer el almac\u{e9}n de credenciales de {provider}: {error}",
+    ),
+```
+
+```rust
+    (
+        "models.store_remedy",
+        "Desbloquea el almac\u{e9}n de credenciales y reintenta, o define la clave de API de {provider} en el entorno",
+    ),
+```
+
+Neither key contains `.footer`, so `every_footer_fits_the_popup_in_both_locales` does not gate
+them; both are body rows, which `draw_popup` wraps.
+
+- [ ] **Step 6: Add `credentials_remedy` and the `fetch_error_message` arm**
+
+In `crates/tui/src/app.rs`, add next to `fetch_error_message`:
+
+```rust
+    /// The remedy line for a credential-class failure.
+    ///
+    /// Class-specific because `/connect` and `/key` both write to the credential store: they are
+    /// the answer to a missing or rejected key and are useless against a store that cannot be
+    /// read. Matching on every variant rather than on a wildcard is deliberate — a new class must
+    /// make this decision rather than inherit it.
+    fn credentials_remedy(&self, provider: &str, class: FetchFailure) -> String {
+        match class {
+            FetchFailure::StoreUnavailable => {
+                self.t_with("models.store_remedy", &[("provider", provider)])
+            }
+            FetchFailure::MissingKey | FetchFailure::Auth | FetchFailure::Fetch => {
+                self.t_with("models.credentials_remedy", &[("provider", provider)])
+            }
+        }
+    }
+```
+
+Add the passthrough arm to `fetch_error_message`:
+
+```rust
+            // Already a complete sentence naming the provider and the cause, like `MissingKey`;
+            // wrapping it would read "Couldn't fetch models: the credential store for openai
+            // could not be read: ...".
+            FetchFailure::StoreUnavailable => err.message.clone(),
+```
+
+and build the remedy in `handle_models_fetched`'s `Credentials` construction:
+
+```rust
+                    .replace_step(Modal::Models(if err.class.needs_credentials() {
+                        let remedy = self.credentials_remedy(&provider, err.class);
+                        ModelsStep::Credentials {
+                            provider,
+                            error: message,
+                            remedy,
+                        }
+                    } else {
+```
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+Run: `cargo test -p light-factory-tui`
+Expected: PASS — the five new tests plus all pre-existing ones.
+
+- [ ] **Step 8: Run clippy and commit**
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+git add crates/tui/src/modal.rs crates/tui/src/app.rs crates/tui/src/i18n.rs
+git commit -m "tui: give an unreadable credential store its own fetch class and remedy"
+```
+
+Expected: all green; clippy clean.
+
+---
+
+### Task 4: Make the resolution seam three-state
+
+**Files:**
+- Modify: `crates/tui/src/selection.rs` (replace `classify` at 22-32, `sources_with` at 41-53,
+  `key_status_with` at 63-71, `resolve_key_from` at 78-84, `resolve_key_with` at 88-97, and the
+  public `key_status` / `resolve_key`; plus the module's `mod tests`)
+- Modify: `crates/tui/src/modal.rs` (`fetch_model_list_inner` at lines 683-698)
+- Modify: `crates/tui/src/app.rs` (`key_status_label` at 1006-1012, `build_provider_rows` at
+  647-661)
+- Modify: `crates/tui/src/i18n.rs` (`provider.key.unavailable`, EN + ES)
+
+**Interfaces:**
+- Consumes: `light_factory_tui::credentials::FailingStore` (Task 2), `crate::text::one_line`
+  (Task 1), `FetchFailure::StoreUnavailable` (Task 3).
+- Produces: `KeyStatus::Unavailable`; `pub enum KeyResolution { Found(String), Missing,
+  Unavailable(String) }`; `pub fn resolve_key(provider: &str, store: &dyn CredentialStore) ->
+  KeyResolution`; `pub fn key_status(provider: &str, store: &dyn CredentialStore) -> KeyStatus`
+  (unchanged signature, new variant).
+
+- [ ] **Step 1: Write the failing tests**
+
+**Delete all nine pre-existing seam tests** from `crates/tui/src/selection.rs`'s `mod tests` — every
+one of them names a function this task removes or a return type it changes, so leaving any behind is
+either a duplicate definition or a type error:
+
+| Line | Test to delete | Why |
+|---|---|---|
+| 172 | `classify_distinguishes_env_keyring_and_none` | `classify` is deleted |
+| 190 | `resolve_key_from_prefers_env_over_keyring` | `resolve_key_from` is deleted |
+| 203 | `resolve_key_from_treats_an_empty_env_value_as_absent` | `resolve_key_from` is deleted |
+| 214 | `resolve_key_reads_a_stored_keyring_key` | compares `resolve_key_with` to `Option<String>` |
+| 226 | `resolve_key_reads_the_env_var_the_provider_declares` | same |
+| 239 | `resolve_key_never_reads_the_env_for_a_provider_with_no_declared_var` | same |
+| 257 | `resolve_key_with_treats_an_empty_env_value_as_absent` | same; the new block redefines this name |
+| 269 | `resolve_key_delegates_to_the_process_env_reader` | same; the new block redefines this name |
+| 278 | `key_status_with_classifies_every_wiring_outcome` | the new block redefines this name |
+
+**Keep** `settings` (the helper at 163), `non_remote_providers_have_no_key` (183), both
+`apply_preferences_*` tests (293, 303), and all three `build_and_info_*` tests (313, 324, 336).
+
+Add `use light_factory_tui::credentials::FailingStore;` to the test module's imports, then add the
+following in place of the deleted block.
+
+```rust
+    #[test]
+    fn env_key_treats_an_empty_value_as_absent() {
+        assert_eq!(
+            env_key("openai", |_| Some("sk-env".to_string())),
+            Some("sk-env".to_string())
+        );
+        assert_eq!(env_key("openai", |_| Some(String::new())), None);
+        assert_eq!(env_key("openai", |_| None), None);
+    }
+
+    /// `env_key_var` yields no name for a provider with no declared var, so the reader is never
+    /// invoked at all — the counting stub proves it.
+    #[test]
+    fn env_key_never_reads_the_env_for_a_provider_with_no_declared_var() {
+        let reads = std::cell::Cell::new(0u32);
+        let counting = |_: &str| {
+            reads.set(reads.get() + 1);
+            Some("sk-env".to_string())
+        };
+        assert_eq!(env_key("ollama", counting), None);
+        assert_eq!(reads.get(), 0);
+    }
+
+    /// The store's error text is what the user reads, so it must survive the seam, on one line.
+    #[test]
+    fn read_store_reduces_a_failure_to_one_line() {
+        let store = FailingStore::new("locked wallet\nsecond line");
+        assert_eq!(
+            read_store("openai", &store),
+            Err("locked wallet".to_string())
+        );
+    }
+
+    /// All four wiring outcomes of `key_status`, including the one `MemStore` could never reach.
+    #[test]
+    fn key_status_with_classifies_every_wiring_outcome() {
+        let empty = MemStore::new();
+        let ring = MemStore::new();
+        ring.set("openai", "sk-ring").unwrap();
+        let broken = FailingStore::default();
+        let set = |_: &str| Some("sk-env".to_string());
+        let blank = |_: &str| Some(String::new());
+        let unset = |_: &str| None;
+
+        assert_eq!(key_status_with("openai", &empty, set), KeyStatus::Env);
+        assert_eq!(key_status_with("openai", &ring, blank), KeyStatus::Keyring);
+        assert_eq!(key_status_with("openai", &ring, unset), KeyStatus::Keyring);
+        assert_eq!(key_status_with("openai", &empty, unset), KeyStatus::None);
+        assert_eq!(
+            key_status_with("openai", &broken, unset),
+            KeyStatus::Unavailable,
+            "a store that cannot answer is not the same as a store with no key"
+        );
+    }
+
+    /// A working environment variable must not be reported as unavailable because the keyring is
+    /// down — the store is not consulted at all once the env has answered.
+    #[test]
+    fn an_env_key_wins_over_a_broken_store() {
+        let broken = FailingStore::default();
+        let set = |_: &str| Some("sk-env".to_string());
+        assert_eq!(key_status_with("openai", &broken, set), KeyStatus::Env);
+        let KeyResolution::Found(key) = resolve_key_with("openai", &broken, set) else {
+            panic!("an env key must resolve even when the store is broken");
+        };
+        assert_eq!(key, "sk-env");
+    }
+
+    #[test]
+    fn resolve_key_with_prefers_env_over_the_keyring() {
+        let store = MemStore::new();
+        store.set("openai", "sk-ring").unwrap();
+        let only_openai = |var: &str| (var == "OPENAI_API_KEY").then(|| "sk-env".to_string());
+        let KeyResolution::Found(key) = resolve_key_with("openai", &store, only_openai) else {
+            panic!("expected a resolved key");
+        };
+        assert_eq!(key, "sk-env");
+    }
+
+    /// The env stub is supplied explicitly so an ambient `OPENAI_API_KEY` cannot decide the
+    /// outcome; the process env is not read.
+    #[test]
+    fn resolve_key_with_reads_a_stored_keyring_key() {
+        let unset = |_: &str| None;
+        let store = MemStore::new();
+        store.set("openai", "sk-ring").unwrap();
+        let KeyResolution::Found(key) = resolve_key_with("openai", &store, unset) else {
+            panic!("expected a resolved key");
+        };
+        assert_eq!(key, "sk-ring");
+        assert_eq!(
+            resolve_key_with("openai", &MemStore::new(), unset),
+            KeyResolution::Missing
+        );
+    }
+
+    /// The empty-env-value rule holds through the wiring, not only inside `env_key`.
+    #[test]
+    fn resolve_key_with_treats_an_empty_env_value_as_absent() {
+        let store = MemStore::new();
+        store.set("openai", "sk-ring").unwrap();
+        let KeyResolution::Found(key) = resolve_key_with("openai", &store, |_| Some(String::new()))
+        else {
+            panic!("expected the keyring value");
+        };
+        assert_eq!(key, "sk-ring");
+    }
+
+    /// The distinction the whole change exists for: a store that fails is not a store with no
+    /// key, and the failure's text survives to the caller.
+    #[test]
+    fn resolve_key_with_reports_a_store_failure_rather_than_a_miss() {
+        let broken = FailingStore::new("no D-Bus session");
+        assert_eq!(
+            resolve_key_with("openai", &broken, |_| None),
+            KeyResolution::Unavailable("no D-Bus session".to_string())
+        );
+    }
+
+    /// The public entry point, deterministic under any ambient environment: `ollama` declares no
+    /// env var, so `process_env` is never consulted and only the store can answer.
+    #[test]
+    fn resolve_key_delegates_to_the_process_env_reader() {
+        let store = MemStore::new();
+        store.set("ollama", "sk-ring").unwrap();
+        let KeyResolution::Found(key) = resolve_key("ollama", &store) else {
+            panic!("expected the stored key");
+        };
+        assert_eq!(key, "sk-ring");
+    }
+
+    /// A live key must never reach a log, an assertion message, or a `dbg!`.
+    #[test]
+    fn a_resolved_key_is_redacted_in_debug_output() {
+        let rendered = format!("{:?}", KeyResolution::Found("sk-secret".to_string()));
+        assert!(!rendered.contains("sk-secret"), "{rendered}");
+        assert_eq!(rendered, "Found(<redacted>)");
+        assert_eq!(format!("{:?}", KeyResolution::Missing), "Missing");
+        assert!(
+            format!("{:?}", KeyResolution::Unavailable("locked".to_string())).contains("locked"),
+            "the failure text is not a secret and must stay visible"
+        );
+    }
+```
+
+Add to `crates/tui/src/modal.rs`'s `mod tests`:
+
+```rust
+    /// End to end through the real seam: an unreadable store produces the store class, not
+    /// `MissingKey`, and the sentence names the store rather than claiming there is no key.
+    #[tokio::test]
+    async fn an_unreadable_store_reports_the_store_failure_not_a_missing_key() {
+        let store = light_factory_tui::credentials::FailingStore::new("no D-Bus session");
+        let err = fetch_model_list("openai", None, &store, Locale::En)
+            .await
+            .expect_err("an unreadable store cannot produce a model list");
+        assert_eq!(err.class, FetchFailure::StoreUnavailable);
+        assert!(err.message.contains("openai"), "{}", err.message);
+        assert!(err.message.contains("no D-Bus session"), "{}", err.message);
+        assert!(
+            !err.message.contains("No API key"),
+            "the store failure must not be reported as a missing key: {}",
+            err.message
+        );
+    }
+```
+
+Add to `crates/tui/src/app.rs`'s `mod tests`:
+
+```rust
+    /// `/key` must not list a provider as having no key when the store could not be asked.
+    ///
+    /// The assertion is the negative on purpose: `key_status` reads the *process* environment and
+    /// `App` has no injection seam for it, so a developer with `OPENAI_API_KEY` exported gets
+    /// `env` here and anyone else gets `unavailable`. Both are correct; `none` is the defect. The
+    /// strict `KeyStatus::Unavailable` assertion lives in `selection.rs`, where the env is
+    /// injected.
+    #[test]
+    fn the_key_listing_never_reports_an_unreadable_store_as_no_key() {
+        let app = test_app_with_store(Arc::new(
+            light_factory_tui::credentials::FailingStore::default(),
+        ));
+        assert_ne!(app.key_status_label("openai"), app.t("provider.key.none"));
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p light-factory-tui`
+Expected: FAIL to compile — `cannot find function 'env_key'`, `cannot find function 'read_store'`,
+`no variant named 'Unavailable' found for enum 'KeyStatus'`, `cannot find type 'KeyResolution'`.
+
+- [ ] **Step 3: Replace the resolution seam in `selection.rs`**
+
+Delete `classify`, `sources_with`, and `resolve_key_from` entirely. Add
+`use crate::text::one_line;` to the module's imports. Write, in their place:
+
+```rust
+/// The env-supplied key for `provider`, if the environment supplies a usable one.
+///
+/// An empty value is treated as absent, so the connect flow never fetches with an empty key. This
+/// is the single statement of that rule — the deleted `classify`/`resolve_key_from` pair stated
+/// it twice.
+fn env_key(provider: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    env_key_var(provider).and_then(env).filter(|k| !k.is_empty())
+}
+
+/// The store's answer for `provider`, with a failure reduced to one display-ready line.
+///
+/// `{:#}` keeps anyhow's source chain, so the cause (no D-Bus session, a locked wallet) survives
+/// rather than only the outermost "failed". [`one_line`] strips control characters because this
+/// text is written into a terminal cell, where a raw `ESC` is an escape-sequence injection. The
+/// length cap belongs to the modal, which already owns it.
+fn read_store(provider: &str, store: &dyn CredentialStore) -> Result<Option<String>, String> {
+    store.get(provider).map_err(|e| one_line(&format!("{e:#}")))
+}
+```
+
+Widen `KeyStatus`:
+
+```rust
+/// Where a provider's key comes from, for the `/key` listing and the `/connect` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatus {
+    Env,
+    Keyring,
+    /// No key is stored, and the environment supplies none.
+    None,
+    /// The credential store could not be read, so whether a key exists is unknown. Distinct from
+    /// [`KeyStatus::None`] on purpose: the remedy for `None` is to store a key, which is not a
+    /// remedy for a store that cannot be read.
+    Unavailable,
+}
+```
+
+Add `KeyResolution`:
+
+```rust
+/// A resolved API key, or why there is none.
+///
+/// The point of the type is the distinction between [`KeyResolution::Missing`] and
+/// [`KeyResolution::Unavailable`]: the first has a remedy the user can act on (store a key), the
+/// second does not, and reporting the second as the first is the defect this replaces.
+#[derive(Clone, PartialEq, Eq)]
+pub enum KeyResolution {
+    Found(String),
+    Missing,
+    /// The store could not be read; the payload is one display-ready line naming the cause.
+    Unavailable(String),
+}
+
+impl std::fmt::Debug for KeyResolution {
+    /// Redacts the key. `Found` holds a live credential, and a `{:?}` at a future call site — a
+    /// `dbg!`, a `tracing` field, an assertion message — would otherwise print it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyResolution::Found(_) => f.write_str("Found(<redacted>)"),
+            KeyResolution::Missing => f.write_str("Missing"),
+            KeyResolution::Unavailable(error) => {
+                f.debug_tuple("Unavailable").field(error).finish()
+            }
+        }
+    }
+}
+```
+
+Rewrite the two `_with` functions and their public wrappers:
+
+```rust
+/// A provider's key source against an explicit environment. Lets the wiring be tested without the
+/// process env deciding the result.
+///
+/// The store is consulted only when the environment did not answer, which is what keeps
+/// [`KeyStatus::Unavailable`] meaningful: a working `OPENAI_API_KEY` must not be reported as
+/// unavailable because the keyring is down.
+fn key_status_with(
+    provider: &str,
+    store: &dyn CredentialStore,
+    env: impl Fn(&str) -> Option<String>,
+) -> KeyStatus {
+    if env_key(provider, env).is_some() {
+        return KeyStatus::Env;
+    }
+    match read_store(provider, store) {
+        Ok(Some(_)) => KeyStatus::Keyring,
+        Ok(None) => KeyStatus::None,
+        Err(_) => KeyStatus::Unavailable,
+    }
+}
+
+/// Classify a provider's key source without revealing the value.
+pub fn key_status(provider: &str, store: &dyn CredentialStore) -> KeyStatus {
+    key_status_with(provider, store, process_env)
+}
+
+/// The resolved API key for a provider against an explicit environment: env wins over the store,
+/// and the store is consulted only when the env has no usable key.
+fn resolve_key_with(
+    provider: &str,
+    store: &dyn CredentialStore,
+    env: impl Fn(&str) -> Option<String>,
+) -> KeyResolution {
+    if let Some(key) = env_key(provider, env) {
+        return KeyResolution::Found(key);
+    }
+    match read_store(provider, store) {
+        Ok(Some(key)) => KeyResolution::Found(key),
+        Ok(None) => KeyResolution::Missing,
+        Err(error) => KeyResolution::Unavailable(error),
+    }
+}
+
+/// The resolved API key for a provider (env over store), or why there is none.
+pub fn resolve_key(provider: &str, store: &dyn CredentialStore) -> KeyResolution {
+    resolve_key_with(provider, store, process_env)
+}
+```
+
+Leave `process_env` exactly as it is.
+
+- [ ] **Step 4: Wire the `/models` fetch to the new resolution**
+
+In `crates/tui/src/modal.rs`, replace `fetch_model_list_inner`'s key resolution:
+
+```rust
+    let key = match key_override {
+        Some(k) => Some(k),
+        None => match crate::selection::resolve_key(provider, store) {
+            crate::selection::KeyResolution::Found(k) => Some(k),
+            crate::selection::KeyResolution::Missing => None,
+            crate::selection::KeyResolution::Unavailable(error) => {
+                return Err(FetchError {
+                    class: FetchFailure::StoreUnavailable,
+                    // Our own sentence rather than a remote one, but still capped: the cap is
+                    // what keeps the modal's own remedy rows on screen when the backend is
+                    // verbose.
+                    message: summarize_provider_error(&i18n::t_with(
+                        locale,
+                        "connect.store_unavailable",
+                        &[("provider", provider), ("error", &error)],
+                    )),
+                });
+            }
+        },
+    };
+    fetch_with_key(provider, key, locale).await
+```
+
+`fetch_with_key` keeps its `Option<String>` signature and its `MissingKey` arm untouched, so the
+"no key" sentence still has exactly one source.
+
+- [ ] **Step 5: Add the `/key` label and its strings**
+
+In `crates/tui/src/app.rs`, add the arm to `key_status_label`:
+
+```rust
+            crate::selection::KeyStatus::Unavailable => {
+                self.t("provider.key.unavailable").to_string()
+            }
+```
+
+In `crates/tui/src/i18n.rs`, add `("provider.key.unavailable", "unavailable"),` to `EN` after
+`provider.key.none` (line 191), and
+`("provider.key.unavailable", "no disponible"),` to `ES` after its `provider.key.none`
+(line 500).
+
+- [ ] **Step 6a: Remove Task 3's temporary dead-code expectation**
+
+Task 3 added `#[cfg_attr(not(test), expect(dead_code, reason = "key resolution does not report an
+unreadable store yet"))]` to `FetchFailure::StoreUnavailable`, because nothing in non-test code
+constructed it until Step 4 above. Step 4 now does, so the `expect` is unfulfilled and the build
+fails under `-D warnings`. Delete the whole `#[cfg_attr(...)]` block and the two paragraphs of the
+variant's doc comment that explain it, leaving the first paragraph ("The credential store could not
+be read…") intact. That the compiler forces this is why `expect` was used instead of `allow`.
+
+- [ ] **Step 6b: Rename the colliding test-local store double in `app.rs`**
+
+`crates/tui/src/app.rs`'s `mod tests` already contains an unrelated `struct FailingStore;` whose
+`get`/`delete` return `Ok` and whose `set` fails, used by
+`handle_connect_key_keyring_failure_sets_error_and_stays`. Two different doubles under one name in
+one file is a trap. Rename the local one to `SetFailsStore`, update its doc comment to
+`/// A store whose \`set\` always fails, for exercising the keyring write-failure branch.`, and
+update its single use site. Do not change its behaviour or what that test asserts — the new tests
+in this task use the fully-qualified `light_factory_tui::credentials::FailingStore`.
+
+- [ ] **Step 6: Stop `/connect` reporting an unreadable store as unconnected**
+
+In `crates/tui/src/app.rs`, `build_provider_rows` currently reads
+`key_status(id, ...) != KeyStatus::None`, which now yields `true` for `Unavailable` — the correct
+navigation, since asking for a key the user already stored is the defect. Make that explicit
+rather than incidental:
+
+```rust
+                let connected = if *id == "ollama" {
+                    std::env::var("LIGHT_OLLAMA").as_deref() == Ok("1")
+                } else {
+                    // `Unavailable` counts as connected here: the store could not be asked, so
+                    // routing to key entry would demand a key the user may already have stored.
+                    // Task 5 gives it its own row state; this keeps the navigation honest now.
+                    !matches!(
+                        crate::selection::key_status(id, self.store.as_ref()),
+                        crate::selection::KeyStatus::None
+                    )
+                };
+```
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+Run: `cargo test -p light-factory-tui`
+Expected: PASS — every new test plus all pre-existing ones.
+
+Also run, as the #49 acceptance criterion this change must not regress:
+`OPENAI_API_KEY=sk-test cargo test -p light-factory-tui`
+Expected: PASS.
+
+- [ ] **Step 8: Run clippy and commit**
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+git add crates/tui/src/selection.rs crates/tui/src/modal.rs crates/tui/src/app.rs crates/tui/src/i18n.rs
+git commit -m "tui: keep a credential store failure distinct from a missing key"
+```
+
+Expected: all green; clippy clean.
+
+---
+
+### Task 5: Give the `/connect` provider rows a third state
+
+**Files:**
+- Modify: `crates/tui/src/modal.rs` (`ProviderRow` at lines 27-33, the `ProviderList` Enter arm at
+  454-470, the `ProviderList` render arm at 965-984, and the `row` test helper at 1384-1388)
+- Modify: `crates/tui/src/app.rs` (`build_provider_rows` at 647-661, and the `ProviderRow`
+  constructions in `mod tests`)
+- Modify: `crates/tui/src/i18n.rs` (`connect.store_unavailable_row`, EN + ES, plus a width test)
+
+**Interfaces:**
+- Consumes: `crate::selection::KeyStatus` (Task 4).
+- Produces: `pub(crate) enum RowKey { Present, Absent, Unavailable }` and
+  `pub(crate) struct ProviderRow { pub(crate) id: String, pub(crate) key: RowKey }`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `crates/tui/src/modal.rs`'s `mod tests`:
+
+```rust
+    /// The store could not be asked, so Enter must not route to key entry: that would demand a
+    /// key the user may already have stored, and storing it would fail against the same store.
+    #[test]
+    fn an_unavailable_row_goes_to_the_model_list_not_key_entry() {
+        let step = ConnectStep::ProviderList {
+            rows: vec![ProviderRow {
+                id: "openai".to_string(),
+                key: RowKey::Unavailable,
+            }],
+            selected: 0,
+        };
+        let ModalTransition::Step(Modal::Connect(next)) =
+            connect_step_next(&step, key(KeyCode::Enter))
+        else {
+            panic!("Enter must step");
+        };
+        assert!(
+            matches!(next, ConnectStep::ModelList { .. }),
+            "expected the model list, got {next:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_row_still_goes_to_key_entry() {
+        let step = ConnectStep::ProviderList {
+            rows: vec![ProviderRow {
+                id: "openai".to_string(),
+                key: RowKey::Absent,
+            }],
+            selected: 0,
+        };
+        let ModalTransition::Step(Modal::Connect(next)) =
+            connect_step_next(&step, key(KeyCode::Enter))
+        else {
+            panic!("Enter must step");
+        };
+        assert!(
+            matches!(next, ConnectStep::KeyEntry { .. }),
+            "expected key entry, got {next:?}"
+        );
+    }
+```
+
+`key` is the existing plain-key helper (`fn key(code: KeyCode) -> KeyEvent` at `modal.rs:1376`,
+next to `ctrl_key` at `:1380`); do not add a second.
+
+Add to `crates/tui/src/app.rs`'s `mod tests`:
+
+```rust
+    /// An unreadable store must not render a provider as though no key were stored — that is the
+    /// row state that routes Enter to key entry.
+    ///
+    /// Negative assertion for the same reason as `the_key_listing_never_reports_...`: with
+    /// `OPENAI_API_KEY` exported this row is `Present`, without it `Unavailable`. `Absent` is the
+    /// defect. `RowKey::Unavailable` itself is pinned in `modal.rs`'s transition tests.
+    #[test]
+    fn provider_rows_never_report_an_unreadable_store_as_having_no_key() {
+        let app = test_app_with_store(Arc::new(
+            light_factory_tui::credentials::FailingStore::default(),
+        ));
+        let rows = app.build_provider_rows();
+        let openai = rows
+            .iter()
+            .find(|r| r.id == "openai")
+            .expect("openai is a listed provider");
+        assert_ne!(openai.key, RowKey::Absent);
+    }
+
+    #[test]
+    fn provider_rows_report_a_stored_key_as_present() {
+        let store = MemStore::new();
+        store.set("openai", "sk-ring").unwrap();
+        let app = test_app_with_store(Arc::new(store));
+        let rows = app.build_provider_rows();
+        let openai = rows.iter().find(|r| r.id == "openai").expect("listed");
+        assert_eq!(openai.key, RowKey::Present);
+    }
+```
+
+Add to `crates/tui/src/i18n.rs`'s `mod tests`:
+
+```rust
+    /// The connect modal's provider rows share the footers' 60-column popup (58 inner), but
+    /// `every_footer_fits_the_popup_in_both_locales` gates `*.footer` keys only. `anthropic` is
+    /// the longest id in `PROVIDER_NAMES`, and the row is drawn as `"> {id} ({suffix})"`.
+    #[test]
+    fn the_unavailable_row_suffix_fits_the_popup_in_both_locales() {
+        const INNER_WIDTH: usize = 58;
+        for (locale, name) in [(Locale::En, "EN"), (Locale::Es, "ES")] {
+            let row = format!(
+                "> anthropic ({})",
+                t(locale, "connect.store_unavailable_row")
+            );
+            let columns = row.chars().count();
+            assert!(columns <= INNER_WIDTH, "{name} row is {columns} columns: {row}");
+        }
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p light-factory-tui`
+Expected: FAIL to compile — `cannot find type 'RowKey' in this scope`, and
+`struct 'ProviderRow' has no field named 'key'`.
+
+- [ ] **Step 3: Replace the boolean with the tri-state**
+
+In `crates/tui/src/modal.rs`, replace `ProviderRow` (lines 27-33) with:
+
+```rust
+/// Whether a provider row has a key behind it.
+///
+/// Three states rather than a boolean because the failure that motivated them is a store that
+/// cannot answer: rendering that as "no key" tells the user to store a key they may already have
+/// stored, and the false branch is the one that routes to key entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowKey {
+    /// A key is available, from the environment or the store.
+    Present,
+    /// The store answered, and there is no key.
+    Absent,
+    /// The store could not be read, so whether a key exists is unknown.
+    Unavailable,
+}
+
+/// One row of the connect modal's provider list. Self-contained (id + key state) so the pure
+/// transition can decide navigation without touching the keyring.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct ProviderRow {
+    pub(crate) id: String,
+    pub(crate) key: RowKey,
+}
+```
+
+The derive list above (`Debug, Clone, PartialEq, Eq`) is exactly what `ProviderRow` already carries
+at `modal.rs:29` — unchanged.
+
+Update the Enter arm (lines 454-470):
+
+```rust
+            KeyCode::Enter => match rows.get(*selected) {
+                // `Unavailable` proceeds like `Present`: the fetch re-reads the store and reports
+                // the real failure, where key entry would ask for a key the user may already have
+                // stored and then fail to write it to the same store.
+                Some(row)
+                    if matches!(row.key, RowKey::Present | RowKey::Unavailable)
+                        || row.id == "ollama" =>
+                {
+                    ModalTransition::Step(Modal::Connect(ConnectStep::ModelList {
+                        rows: rows.clone(),
+                        provider: row.id.clone(),
+                        models: Vec::new(),
+                        selected: 0,
+                        fetching: true,
+                        error: None,
+                        from_key: false,
+                    }))
+                }
+```
+
+Update the render arm's suffix (lines 974-978):
+
+```rust
+                let suffix = match row.key {
+                    RowKey::Present => format!(" ({})", i18n::t(ctx.locale, "connect.connected")),
+                    RowKey::Absent => String::new(),
+                    RowKey::Unavailable => format!(
+                        " ({})",
+                        i18n::t(ctx.locale, "connect.store_unavailable_row")
+                    ),
+                };
+```
+
+Update the `row` test helper (lines 1384-1388) to build from a `RowKey`:
+
+```rust
+    fn row(id: &str, key: RowKey) -> ProviderRow {
+        ProviderRow {
+            id: id.to_string(),
+            key,
+        }
+    }
+```
+
+and update its call sites in `modal.rs`'s tests: `row(id, true)` becomes `row(id, RowKey::Present)`
+and `row(id, false)` becomes `row(id, RowKey::Absent)`. Do not change what those tests assert.
+
+- [ ] **Step 4: Add the row-suffix strings**
+
+In `crates/tui/src/i18n.rs`, add to `EN` after `connect.connected` (line 266):
+
+```rust
+    ("connect.store_unavailable_row", "key store unavailable"),
+```
+
+and to `ES` after its `connect.connected` (line 584):
+
+```rust
+    (
+        "connect.store_unavailable_row",
+        "almac\u{e9}n de claves no disponible",
+    ),
+```
+
+- [ ] **Step 5: Map `KeyStatus` to `RowKey` in `build_provider_rows`**
+
+In `crates/tui/src/app.rs`, replace the body written in Task 4 Step 6:
+
+```rust
+    fn build_provider_rows(&self) -> Vec<ProviderRow> {
+        PROVIDER_NAMES
+            .iter()
+            .map(|id| {
+                let key = if *id == "ollama" {
+                    // Ollama takes no API key; `LIGHT_OLLAMA` is the whole of its configuration,
+                    // so the credential store is never consulted for it.
+                    if std::env::var("LIGHT_OLLAMA").as_deref() == Ok("1") {
+                        RowKey::Present
+                    } else {
+                        RowKey::Absent
+                    }
+                } else {
+                    match crate::selection::key_status(id, self.store.as_ref()) {
+                        crate::selection::KeyStatus::Env
+                        | crate::selection::KeyStatus::Keyring => RowKey::Present,
+                        crate::selection::KeyStatus::None => RowKey::Absent,
+                        crate::selection::KeyStatus::Unavailable => RowKey::Unavailable,
+                    }
+                };
+                ProviderRow {
+                    id: id.to_string(),
+                    key,
+                }
+            })
+            .collect()
+    }
+```
+
+Add `RowKey` to `app.rs`'s `use crate::modal::{...}` import list (alongside `ProviderRow`) and to
+the `use super::{...}` list in `app.rs`'s `mod tests`. Update every `ProviderRow { id, connected }`
+construction in `app.rs`'s tests to `ProviderRow { id, key: RowKey::Present }` (or `Absent`,
+matching what the test previously meant by `connected: false`).
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+Run: `cargo test -p light-factory-tui`
+Expected: PASS — the five new tests plus all pre-existing ones.
+
+- [ ] **Step 7: Run clippy and commit**
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+git add crates/tui/src/modal.rs crates/tui/src/app.rs crates/tui/src/i18n.rs
+git commit -m "tui: give the connect provider rows an unreadable-store state"
+```
+
+Expected: all green; clippy clean.
+
+---
+
+### Task 6: Say so when the offline fallback was caused by the store
+
+**Files:**
+- Modify: `crates/tui/src/provider.rs` (`ProviderInfo` at lines 11-20, add `StoreFailure` and
+  `ProviderInfo::notices`, and the `info` test helper at 74-82)
+- Modify: `crates/tui/src/selection.rs` (`apply_preferences` at 108-126, `build_selection` at
+  128-131, `rebuild` at 146-152)
+- Modify: `crates/tui/src/app.rs` (`enter_engine`'s notice assembly at lines 333-339, and the
+  `ProviderInfo` construction in `test_app_with_store`)
+- Modify: `crates/tui/src/i18n.rs` (`provider.store.unavailable`,
+  `provider.offline.store_unavailable`, EN + ES)
+
+**Interfaces:**
+- Consumes: `crate::selection::read_store` (Task 4), `FailingStore` (Task 2).
+- Produces: `pub struct StoreFailure { pub provider: String, pub error: String }` in
+  `crate::provider`; `ProviderInfo.store_failures: Vec<StoreFailure>`;
+  `ProviderInfo::notices(&self, locale: Locale) -> Vec<String>`;
+  `apply_preferences(..) -> (Selection, Vec<StoreFailure>)` and
+  `build_selection(..) -> (Selection, Vec<StoreFailure>)`. `rebuild`'s signature is unchanged.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `crates/tui/src/selection.rs`'s `mod tests`:
+
+```rust
+    /// The startup path must report a store it could not read instead of silently continuing
+    /// with an empty key map — the silence is what makes the offline fallback inexplicable.
+    #[test]
+    fn apply_preferences_reports_a_store_failure_for_every_remote_provider() {
+        let broken = FailingStore::new("no D-Bus session");
+        let (selection, failures) =
+            apply_preferences(Selection::default(), &settings(None), &broken);
+        assert!(selection.keys.is_empty());
+        assert_eq!(failures.len(), REMOTE_IDS.len());
+        assert!(failures.iter().all(|f| f.error == "no D-Bus session"));
+        assert!(failures.iter().any(|f| f.provider == "openai"));
+    }
+
+    /// A store failure is per-entry, so a partial failure must not discard the keys that did
+    /// resolve. An env-supplied key is already in `base.keys` and is never re-read.
+    #[test]
+    fn apply_preferences_keeps_an_env_key_and_reports_nothing_for_it() {
+        let broken = FailingStore::default();
+        let mut base = Selection::default();
+        base.keys.insert("openai".to_string(), "sk-env".to_string());
+        let (selection, failures) = apply_preferences(base, &settings(None), &broken);
+        assert_eq!(selection.keys.get("openai"), Some(&"sk-env".to_string()));
+        assert!(
+            failures.iter().all(|f| f.provider != "openai"),
+            "a provider the env already answered for is never read from the store"
+        );
+    }
+
+    #[test]
+    fn apply_preferences_reports_no_failures_for_a_working_store() {
+        let store = MemStore::new();
+        store.set("openai", "sk-o").unwrap();
+        let (selection, failures) =
+            apply_preferences(Selection::default(), &settings(Some("openai")), &store);
+        assert!(failures.is_empty());
+        assert_eq!(selection.keys.get("openai"), Some(&"sk-o".to_string()));
+    }
+
+    /// `rebuild` is the startup entry point; the failures have to survive it or nothing can
+    /// render them.
+    /// `build_selection` starts from `selection_from_env()`, so a developer with all four of
+    /// `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`GEMINI_API_KEY`/`DEEPSEEK_API_KEY` exported would see
+    /// every provider skipped before the store is read and no failure recorded. That is the same
+    /// ambient-env caveat the App-level tests carry; the injected-env assertions live in
+    /// `apply_preferences_reports_a_store_failure_for_every_remote_provider` above.
+    #[test]
+    fn rebuild_carries_store_failures_into_the_provider_info() {
+        let broken = FailingStore::default();
+        let (_provider, info) = rebuild(&settings(None), &broken);
+        assert!(!info.store_failures.is_empty());
+    }
+```
+
+The two pre-existing `apply_preferences_*` tests destructure a single return value; update them to
+`let (selection, _failures) = apply_preferences(...)`.
+
+Add to `crates/tui/src/provider.rs`'s `mod tests`:
+
+```rust
+    fn failure(provider: &str) -> StoreFailure {
+        StoreFailure {
+            provider: provider.to_string(),
+            error: "locked".to_string(),
+        }
+    }
+
+    /// The issue's third acceptance criterion: an offline fallback caused by an unreadable store
+    /// must say so, instead of telling the user to set a key they already set.
+    #[test]
+    fn a_store_failure_replaces_the_nothing_configured_notice() {
+        let mut info = info(Some(OfflineReason::NothingConfigured), None);
+        info.store_failures = vec![failure("openai")];
+        let notices = info.notices(Locale::En);
+        assert!(
+            notices.iter().any(|n| n.contains("openai") && n.contains("locked")),
+            "the failing provider and cause must be named: {notices:?}"
+        );
+        assert!(
+            !notices.iter().any(|n| n.contains("No provider configured")),
+            "the nothing-configured notice is false here: {notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("credential store")),
+            "the offline line must name the store: {notices:?}"
+        );
+    }
+
+    /// Only `NothingConfigured` is substituted: a rejected base URL has its own real cause, and
+    /// overwriting it would repeat this very bug in the other direction.
+    #[test]
+    fn a_store_failure_does_not_overwrite_another_offline_reason() {
+        let mut info = info(
+            Some(OfflineReason::BaseUrlRejected {
+                var: "LIGHT_OPENAI_BASE_URL".into(),
+            }),
+            None,
+        );
+        info.store_failures = vec![failure("openai")];
+        let notices = info.notices(Locale::En);
+        assert!(
+            notices.iter().any(|n| n.contains("LIGHT_OPENAI_BASE_URL")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("openai") && n.contains("locked")),
+            "the store failure is still reported on its own line: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn notices_without_a_store_failure_are_unchanged() {
+        let info = info(Some(OfflineReason::NothingConfigured), None);
+        assert_eq!(
+            info.notices(Locale::En),
+            vec![offline_notice(Locale::En, &OfflineReason::NothingConfigured)]
+        );
+    }
+
+    #[test]
+    fn notices_keep_the_selection_warnings_first() {
+        let mut info = info(None, Some(SelectedBy::KeyPrecedence));
+        info.warnings = vec!["a warning".to_string()];
+        info.store_failures = vec![failure("openai")];
+        let notices = info.notices(Locale::En);
+        assert_eq!(notices[0], "a warning");
+        assert_eq!(notices.len(), 2, "a live provider adds no offline line");
+    }
+
+    #[test]
+    fn a_live_provider_with_no_warnings_has_no_notices() {
+        assert!(
+            info(None, Some(SelectedBy::KeyPrecedence))
+                .notices(Locale::En)
+                .is_empty()
+        );
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p light-factory-tui`
+Expected: FAIL to compile — `cannot find type 'StoreFailure'`, `no method named 'notices'`, and
+`this expression has type 'Selection'` at the `let (selection, failures) = apply_preferences(...)`
+destructurings.
+
+- [ ] **Step 3: Add `StoreFailure`, the field, and `notices`**
+
+In `crates/tui/src/provider.rs`, add above `ProviderInfo`:
+
+```rust
+/// One provider's credential-store read that failed, with the cause already reduced to one line.
+///
+/// It lives here rather than in `crates/providers` because the credential store is a TUI concept:
+/// the providers crate has no notion of a keyring, and giving `OfflineReason` a variant for one
+/// would make it name a dependency it does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreFailure {
+    pub provider: String,
+    pub error: String,
+}
+```
+
+Add the field to `ProviderInfo`:
+
+```rust
+    /// Providers whose stored key could not be read. Empty when the store answered for all of
+    /// them — including when it answered "no key".
+    pub store_failures: Vec<StoreFailure>,
+```
+
+Add the method:
+
+```rust
+impl ProviderInfo {
+    /// Every line the engine pane shows about how this provider was chosen: the selection
+    /// warnings, one line per unreadable credential store, then the offline notice if it is
+    /// offline.
+    ///
+    /// The offline line is substituted only for [`OfflineReason::NothingConfigured`], and only
+    /// when a store actually failed: that is the one case where the store is why `keys` is empty.
+    /// Every other reason has its own real cause, and overwriting it would repeat the defect this
+    /// exists to fix, in the other direction — the failure is already reported on its own line.
+    pub fn notices(&self, locale: Locale) -> Vec<String> {
+        let mut lines = self.warnings.clone();
+        for failure in &self.store_failures {
+            lines.push(i18n::t_with(
+                locale,
+                "provider.store.unavailable",
+                &[("provider", &failure.provider), ("error", &failure.error)],
+            ));
+        }
+        if let Some(reason) = &self.offline {
+            let store_caused = !self.store_failures.is_empty()
+                && matches!(reason, OfflineReason::NothingConfigured);
+            lines.push(if store_caused {
+                i18n::t(locale, "provider.offline.store_unavailable").to_string()
+            } else {
+                offline_notice(locale, reason)
+            });
+        }
+        lines
+    }
+}
+```
+
+Place it inside the existing `impl ProviderInfo` block next to `display` and `reason` rather than
+opening a second one. Update the `info` test helper (lines 74-82) to add
+`store_failures: Vec::new(),`.
+
+- [ ] **Step 4: Add the EN and ES strings**
+
+In `crates/tui/src/i18n.rs`, add to `EN` next to the other `provider.offline.*` entries
+(lines 120-130):
+
+```rust
+    (
+        "provider.store.unavailable",
+        "Could not read the stored key for {provider}: {error}",
+    ),
+    (
+        "provider.offline.store_unavailable",
+        "Falling back to the offline provider: the credential store could not be read, so stored keys were unavailable",
+    ),
+```
+
+and to `ES` at the mirrored positions (lines 414-424):
+
+```rust
+    (
+        "provider.store.unavailable",
+        "No se pudo leer la clave guardada de {provider}: {error}",
+    ),
+    (
+        "provider.offline.store_unavailable",
+        "Usando el proveedor sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales, as\u{ed} que las claves guardadas no estaban disponibles",
+    ),
+```
+
+- [ ] **Step 5: Carry the failures out of `build_selection`**
+
+In `crates/tui/src/selection.rs`, add `use crate::provider::StoreFailure;` to the imports and
+rewrite the three functions:
+
+```rust
+/// Layer the persisted preferences and stored keys over an env-derived [`Selection`], reporting
+/// any provider whose stored key could not be read.
+///
+/// A failed read contributes no key and one [`StoreFailure`]: the fallback is unchanged, but it
+/// is no longer silent.
+pub fn apply_preferences(
+    mut base: Selection,
+    settings: &Settings,
+    store: &dyn CredentialStore,
+) -> (Selection, Vec<StoreFailure>) {
+    let mut failures = Vec::new();
+    for id in REMOTE_IDS {
+        if base.keys.contains_key(id) {
+            continue;
+        }
+        match read_store(id, store) {
+            Ok(Some(key)) => {
+                base.keys.insert(id.to_string(), key);
+            }
+            Ok(None) => {}
+            Err(error) => failures.push(StoreFailure {
+                provider: id.to_string(),
+                error,
+            }),
+        }
+    }
+    base.preferred = settings.provider.clone();
+    for (id, model) in &settings.models {
+        base.models
+            .entry(id.clone())
+            .or_insert_with(|| model.clone());
+    }
+    (base, failures)
+}
+
+/// Assemble the effective [`Selection`]: environment (via the providers crate), then the stored
+/// keys and persisted preferences layered on top, plus any store failure encountered.
+pub fn build_selection(
+    settings: &Settings,
+    store: &dyn CredentialStore,
+) -> (Selection, Vec<StoreFailure>) {
+    apply_preferences(selection_from_env(), settings, store)
+}
+```
+
+and fold the failures into the info in `rebuild`:
+
+```rust
+/// Build the active provider and its display record from the given settings and credential store.
+pub fn rebuild(
+    settings: &Settings,
+    store: &dyn CredentialStore,
+) -> (Arc<dyn Provider>, ProviderInfo) {
+    let (selection, store_failures) = build_selection(settings, store);
+    let (provider, mut info) = build_and_info(&selection);
+    info.store_failures = store_failures;
+    (provider, info)
+}
+```
+
+Add `store_failures: Vec::new(),` to the `ProviderInfo` literal in `build_and_info` (line 139).
+
+- [ ] **Step 6: Render the notices**
+
+In `crates/tui/src/app.rs`, `enter_engine` currently reads:
+
+```rust
+        self.engine_log.clear();
+        for warning in info.warnings {
+            self.engine_log.push(warning);
+        }
+        if let Some(reason) = &info.offline {
+            self.engine_log
+                .push(crate::provider::offline_notice(self.config.lang, reason));
+        }
+```
+
+Replace **only the loop and the `if let`** (lines 333-339) — `self.engine_log.clear()` on line 332
+stays, or the engine log accumulates across re-entries. The result reads:
+
+```rust
+        self.engine_log.clear();                                  // line 332, unchanged
+        self.engine_log.extend(info.notices(self.config.lang));   // replaces 333-339
+```
+
+Add `store_failures: Vec::new(),` to the `ProviderInfo` literal in `test_app_with_store`.
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+Run: `cargo test -p light-factory-tui`
+Expected: PASS — the nine new tests plus all pre-existing ones.
+
+- [ ] **Step 8: Run the whole workspace, clippy, and commit**
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+git add crates/tui/src/provider.rs crates/tui/src/selection.rs crates/tui/src/app.rs crates/tui/src/i18n.rs
+git commit -m "tui: name the credential store when it is why the provider fell back to offline"
+```
+
+Expected: all green; clippy clean. The `crates/persistence` integration test skips without
+`DATABASE_URL` — that is the documented pre-existing behaviour, not a regression.
+
+## Deviations from the plan as written
+
+- **Task 3 added a temporary `expect(dead_code)` on `FetchFailure::StoreUnavailable`.** The task as
+  written left the variant constructed only by tests until Task 4 wired the resolution seam, which
+  fails the bin target under `-D warnings`. The implementer added
+  `#[cfg_attr(not(test), expect(dead_code, reason = "…"))]` — `expect` rather than `allow`, so the
+  suppression becomes a compile error the moment Task 4 constructs the variant. Task 4 Step 6a
+  removes it. Accepted: the alternative was to merge Tasks 3 and 4, losing the independent review
+  of the class and its remedy.
+- **Task 4 renames `app.rs`'s test-local `FailingStore` to `SetFailsStore`** (Step 6b). Not in the
+  original plan; added after the Task 2 spec review flagged that the library's new `FailingStore`
+  (all operations fail) and a pre-existing test-local `FailingStore` (only `set` fails) would
+  otherwise share a name in one file.
+- **Task 4's `modal.rs` end-to-end test uses provider `"local"`, not `"openai"`.** As the plan wrote
+  it the test passed a plain `cargo test` but failed under `OPENAI_API_KEY=sk-test`:
+  `fetch_model_list` reads the *process* environment and has no injection seam, so an ambient key
+  resolves via `KeyResolution::Found`, the store is never consulted, and the fetch escapes to a real
+  network request that returns `Auth` rather than `StoreUnavailable`. `"local"` declares no env var
+  (`env_key_var("local") == None`), so `env_key` cannot answer and only the store can — the same
+  technique the plan already uses with `"ollama"` in
+  `resolve_key_delegates_to_the_process_env_reader`. Every assertion survives verbatim except
+  `contains("openai")` → `contains("local")`; the strict class assertion is kept rather than
+  weakened. This also stops the suite reaching the network on any machine with a provider key
+  exported.
+- **Task 4 also fixed two comment inaccuracies in `modal.rs`** surfaced by the Task 3 quality
+  review: the `ModelsStep::Credentials` doc's "pure function of the step" claim (`models_view`
+  already takes a locale-bearing `ModalContext`), replaced with the real argument — the carried
+  `remedy` follows the sibling `error` field that `app.rs` already precomputes; and the render arm's
+  reference to "the input box", which belongs to `ModelsStep::Manual`, not `Credentials`.
+
+---
+
+# Round 2 — findings from the PR #68 agent review
+
+Eight reviewers ran against the opened PR. Two Critical findings mean the change does not deliver
+acceptance criterion (b) on the *primary* path — a keyring that is already locked when the TUI
+starts. The tasks below close them, plus the Important tier. Task order matters: Task 8 builds the
+remedy seam that Task 9 needs.
+
+Deferred to follow-up issues rather than fixed here: `KeyStatus::Unavailable` carrying its cause so
+`/key` is actionable; surfacing store failures outside the engine pane; an `ErrorLine` newtype; a
+`FetchError::sanitized` chokepoint; an env-injection seam for `fetch_model_list`; moving the binary
+modules into the library so `FailingStore` can be `#[cfg(test)]`.
+
+---
+
+### Task 7: Report the store on `/models` when the fallback already happened
+
+**Critical.** `enter_models` short-circuits on `provider_info.offline.is_some()` before any fetch, so
+with the keyring locked at startup the user sees `models.offline` — "Use /connect to connect a
+provider first" — which is the original bug verbatim: it names no fault and points at a flow that
+writes to the store that just failed. `FetchFailure::StoreUnavailable` is currently reachable only
+in the narrower mid-session window. `self.provider_info.store_failures` is in scope one line above
+and is ignored.
+
+**Files:** `crates/tui/src/app.rs`.
+
+- [ ] **Step 1: Failing test** in `app.rs`'s `mod tests`:
+
+```rust
+    /// The headline case from #51: the keyring is already locked when the TUI starts, so
+    /// `rebuild` records the failures, no key resolves, and the provider is offline before
+    /// `/models` is ever opened. The offline step would send the user to `/connect`, which writes
+    /// to the same unreadable store.
+    #[test]
+    fn models_reports_the_store_when_the_offline_fallback_was_its_fault() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.provider_info.store_failures = vec![crate::provider::StoreFailure {
+            provider: "openai".to_string(),
+            error: "no D-Bus session".to_string(),
+        }];
+        app.enter_models();
+        let Some(ModelsStep::Credentials { error, .. }) = models_step(&app) else {
+            panic!("expected the credentials step, got {:?}", models_step(&app));
+        };
+        assert!(error.contains("openai") && error.contains("no D-Bus session"), "{error}");
+    }
+
+    /// Offline for a reason that is not the store still gets the plain offline step.
+    #[test]
+    fn models_still_reports_offline_when_no_store_failed() {
+        let mut app = test_app();
+        app.provider_info.offline = Some(OfflineReason::NothingConfigured);
+        app.enter_models();
+        assert!(matches!(models_step(&app), Some(ModelsStep::Offline)));
+    }
+```
+
+`enter_models` opens the modal through `open_modal`, which spawns a fetch only when the step names a
+fetch target. `ModelsStep::Credentials` and `ModelsStep::Offline` both name `None`, so neither test
+needs a runtime.
+
+- [ ] **Step 2:** Run `cargo test -p light-factory-tui models_reports` — expect FAIL (the first test
+      gets `ModelsStep::Offline`).
+
+- [ ] **Step 3:** In `enter_models`, replace the offline arm and add the helper next to it:
+
+```rust
+        if self.provider_info.offline.is_some() {
+            let step = self.offline_models_step();
+            self.open_modal(Modal::Models(step), None);
+            return;
+        }
+```
+
+```rust
+    /// The step `/models` opens when no live provider is active.
+    ///
+    /// A store failure recorded by the last `rebuild` is *why* there is no key, so the plain
+    /// offline step — "use /connect first" — would send the user into a flow that writes to the
+    /// same unreadable store. Report the store instead, on the step that carries a remedy and a
+    /// Ctrl+R that re-reads it.
+    fn offline_models_step(&self) -> ModelsStep {
+        let Some(failure) = self.provider_info.store_failures.first() else {
+            return ModelsStep::Offline;
+        };
+        ModelsStep::Credentials {
+            error: self.t_with(
+                "provider.store.unavailable",
+                &[("provider", &failure.provider), ("error", &failure.error)],
+            ),
+            class: FetchFailure::StoreUnavailable,
+            provider: failure.provider.clone(),
+        }
+    }
+```
+
+**Note:** the `class` field replaces `remedy` in Task 8, which lands first. If Task 8 has not landed
+when you implement this, use `remedy: self.credentials_remedy(&failure.provider,
+FetchFailure::StoreUnavailable)` instead and Task 8 will convert it.
+
+- [ ] **Step 4:** `cargo test -p light-factory-tui` — expect PASS.
+- [ ] **Step 5:** `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all`, commit
+      as `tui: report the credential store on /models when it caused the offline fallback`.
+
+---
+
+### Task 8: Derive the credential remedy from the class at render time
+
+The credentials step carries a **pre-localized** `remedy: String`, which (a) goes stale when `/lang`
+changes the locale on an open modal, (b) costs seven meaningless `remedy: "remedy".to_string()`
+fixture lines, (c) put the class-based branch in `app.rs` even though `FetchFailure` is defined in
+`modal.rs`, and (d) leaves `credentials_remedy`'s `FetchFailure::Fetch` arm pre-committing an
+unreachable class to the `/connect`-`/key` remedy — the exact inheritance its own doc comment
+forbids. Task 9 also needs the remedy from a second render site, which a stored string cannot serve.
+
+**Files:** `crates/tui/src/modal.rs`, `crates/tui/src/app.rs`.
+
+- [ ] **Step 1: Failing test** in `modal.rs`'s `mod tests`:
+
+```rust
+    /// Every credential class names a remedy, and a store failure's differs from the one the
+    /// key-shaped failures get — `/connect` and `/key` both write to the store that just failed.
+    #[test]
+    fn every_credential_class_names_its_own_remedy() {
+        for class in [FetchFailure::MissingKey, FetchFailure::Auth, FetchFailure::StoreUnavailable] {
+            assert!(class.remedy_key().is_some(), "{class:?} has no remedy");
+        }
+        assert_eq!(FetchFailure::Fetch.remedy_key(), None, "a retryable failure has no remedy");
+        assert_ne!(
+            FetchFailure::StoreUnavailable.remedy_key(),
+            FetchFailure::MissingKey.remedy_key()
+        );
+    }
+
+    /// The rendered remedy follows the locale in force at render time, not the one that happened
+    /// to be set when the step was built — `/lang` can change it while the modal is open.
+    #[test]
+    fn the_credentials_remedy_is_rendered_in_the_current_locale() {
+        let step = ModelsStep::Credentials {
+            provider: "openai".to_string(),
+            error: "refused".to_string(),
+            class: FetchFailure::Auth,
+        };
+        let en = models_view(&step, &ctx(Locale::En));
+        let es = models_view(&step, &ctx(Locale::Es));
+        assert_ne!(body_text(&en), body_text(&es));
+    }
+```
+
+Add whatever small `ctx(locale)` / `body_text(view)` helpers the module needs (concatenate each
+`Line`'s span contents), or reuse existing ones if present.
+
+- [ ] **Step 2:** Run `cargo test -p light-factory-tui` — expect FAIL to compile.
+
+- [ ] **Step 3:** Add to `impl FetchFailure` in `modal.rs`:
+
+```rust
+    /// The i18n key of the remedy for this class, or `None` when the remedy is simply to retry.
+    ///
+    /// This is the single statement of "what can the user do about it": `needs_credentials` is
+    /// `remedy_key().is_some()`, and both render sites look the string up here rather than
+    /// carrying a pre-localized copy that `/lang` would leave stale.
+    pub(crate) fn remedy_key(self) -> Option<&'static str> {
+        match self {
+            // `/connect` and `/key` both write to the credential store, so neither is a remedy
+            // for a store that cannot be read.
+            FetchFailure::StoreUnavailable => Some("models.store_remedy"),
+            FetchFailure::MissingKey | FetchFailure::Auth => Some("models.credentials_remedy"),
+            FetchFailure::Fetch => None,
+        }
+    }
+```
+
+and redefine the predicate in terms of it, deleting the `matches!` (this is also the architect's
+finding that a fifth variant would silently answer `false` and land on the model-id text box):
+
+```rust
+    pub(crate) fn needs_credentials(self) -> bool {
+        self.remedy_key().is_some()
+    }
+```
+
+- [ ] **Step 4:** Replace `ModelsStep::Credentials`'s `remedy: String` field with
+      `class: FetchFailure`, updating its doc comment: the step carries the *class* so the render
+      stays locale-correct and the branch stays in the module that defines the enum.
+
+- [ ] **Step 5:** In `models_view`'s `Credentials` arm, bind `{ provider, error, class }` and
+      replace the `remedy.clone()` push with a lookup:
+
+```rust
+            if let Some(key) = class.remedy_key() {
+                lines.push(Line::from(Span::styled(
+                    i18n::t_with(ctx.locale, key, &[("provider", provider)]),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+```
+
+- [ ] **Step 6:** Delete `App::credentials_remedy` and its two tests
+      (`a_store_failure_gets_its_own_remedy`, `every_credential_class_has_a_remedy` — Step 1
+      replaces both at the layer that now owns the decision). In `handle_models_fetched`, build the
+      step with `class: err.class` instead of the computed remedy. Update every
+      `ModelsStep::Credentials` construction in both files' tests: `remedy: "remedy".to_string()`
+      becomes `class: FetchFailure::Auth` (or whichever class that test means).
+
+- [ ] **Step 7:** `cargo test -p light-factory-tui`, `cargo clippy --workspace --all-targets -- -D warnings`,
+      `cargo fmt --all`. Commit as `tui: derive the credential remedy from the failure class`.
+
+---
+
+### Task 9: Carry the failure class into the `/connect` modal
+
+**Critical.** `begin_model_fetch` throws the class away (`result.map_err(|e| e.message)`) and
+`handle_connect_models` wraps unconditionally in `connect.fetch_error`, so a store failure renders as
+*"Couldn't fetch models: the credential store for openai could not be read: no D-Bus session"* — the
+exact double-wrap `fetch_error_message` exists to prevent, and which
+`a_store_failure_message_is_passed_through_unwrapped` asserts against on the sibling sink. The remedy
+is unreachable from `/connect` entirely, and Esc routes a store failure to key entry
+(`from_key || error.is_some()`) as though the user had mistyped a key. Task 5 is what routes
+`RowKey::Unavailable` into this sink, so this PR is what made it reachable.
+
+**Files:** `crates/tui/src/app.rs`, `crates/tui/src/modal.rs`.
+
+- [ ] **Step 1: Failing tests** in `app.rs`'s `mod tests`:
+
+```rust
+    /// The `/connect` sink must not re-wrap a sentence that already names the provider and the
+    /// cause: "Couldn't fetch models: the credential store for openai could not be read: ...".
+    #[test]
+    fn connect_does_not_double_wrap_a_store_failure() {
+        let mut app = test_app();
+        let nonce = open(&mut app, Modal::Connect(model_list_step(vec![], true)));
+        app.handle_connect_models(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(FetchFailure::StoreUnavailable, "store for openai could not be read")),
+        );
+        let Some(ConnectStep::ModelList { error, remedy, .. }) = connect_step(&app) else {
+            panic!("expected the model list, got {:?}", connect_step(&app));
+        };
+        let error = error.as_deref().expect("a failed fetch sets an error");
+        assert!(!error.contains("Couldn't fetch models"), "double-wrapped: {error}");
+        assert!(remedy.is_some(), "a credential-class failure must offer its remedy");
+    }
+
+    /// A transport failure keeps the wrapper it has always had, and offers no remedy.
+    #[test]
+    fn connect_still_wraps_a_transport_error() {
+        let mut app = test_app();
+        let nonce = open(&mut app, Modal::Connect(model_list_step(vec![], true)));
+        app.handle_connect_models(
+            nonce,
+            "openai".to_string(),
+            Err(fetch_err(FetchFailure::Fetch, "connection refused")),
+        );
+        let Some(ConnectStep::ModelList { error, remedy, .. }) = connect_step(&app) else {
+            panic!("expected the model list");
+        };
+        assert!(error.as_deref().unwrap().contains("connection refused"));
+        assert_eq!(*remedy, None);
+    }
+```
+
+and in `modal.rs`'s `mod tests`:
+
+```rust
+    /// Esc after a store failure must not land on the key field: the user did not mistype a key,
+    /// and writing one would fail against the same unreadable store.
+    #[test]
+    fn esc_after_a_store_failure_returns_to_the_provider_list() {
+        let step = ConnectStep::ModelList {
+            rows: vec![row("openai", RowKey::Unavailable)],
+            provider: "openai".to_string(),
+            models: Vec::new(),
+            selected: 0,
+            fetching: false,
+            error: Some("could not be read".to_string()),
+            failure: Some(FetchFailure::StoreUnavailable),
+            remedy: None,
+            from_key: false,
+        };
+        let ModalTransition::Step(Modal::Connect(next)) = connect_step_next(&step, key(KeyCode::Esc))
+        else {
+            panic!("Esc must step");
+        };
+        assert!(matches!(next, ConnectStep::ProviderList { .. }), "got {next:?}");
+    }
+```
+
+(Adjust the literal to whatever field set Step 3 settles on — `remedy` is dropped if the class alone
+drives the render.)
+
+- [ ] **Step 2:** Run `cargo test -p light-factory-tui` — expect FAIL to compile.
+
+- [ ] **Step 3:** Give `ConnectStep::ModelList` a `failure: Option<FetchFailure>` field beside
+      `error: Option<String>`, documented as: the class that produced `error`, so the step can offer
+      the same class-specific remedy `/models` does and decide where Esc goes. Set it to `None` at
+      every construction site in `connect_step_next` and in tests.
+
+- [ ] **Step 4:** Stop discarding the class in `begin_model_fetch`:
+
+```rust
+                FetchSink::Connect => UiEvent::ConnectModels { nonce, provider, result },
+```
+
+and widen `UiEvent::ConnectModels`'s `result` to `Result<Vec<String>, FetchError>`. Delete the
+now-false comment about the connect modal rendering only the message.
+
+- [ ] **Step 5:** In `handle_connect_models`, classify before taking the mutable borrow:
+
+```rust
+        let outcome = match result {
+            Ok(list) => Ok(list),
+            Err(e) => Err((self.fetch_error_message(&provider, &e), e.class)),
+        };
+        if let Some(Modal::Connect(ConnectStep::ModelList {
+            models, selected, fetching, error, failure, ..
+        })) = self.modal.current_mut()
+        {
+            *fetching = false;
+            match outcome {
+                Ok(list) => {
+                    *models = list;
+                    *selected = 0;
+                    *error = None;
+                    *failure = None;
+                }
+                Err((message, class)) => {
+                    *error = Some(message);
+                    *failure = Some(class);
+                }
+            }
+        }
+```
+
+- [ ] **Step 6:** In `connect_view`'s `ModelList` arm, push the remedy above the error, so the
+      trusted row survives clipping ahead of the foreign one:
+
+```rust
+            } else if let Some(err) = error {
+                if let Some(key) = failure.and_then(FetchFailure::remedy_key) {
+                    lines.push(Line::from(Span::styled(
+                        i18n::t_with(ctx.locale, key, &[("provider", provider)]),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red))));
+            }
+```
+
+- [ ] **Step 7:** Exclude a store failure from the "back to the key field" rule in
+      `connect_step_next`'s `ModelList` Esc arm:
+
+```rust
+                let mistyped_key = *from_key || error.is_some();
+                // A store failure is not a mistyped key: the field would take one and then fail to
+                // write it to the same unreadable store.
+                let store_failed = *failure == Some(FetchFailure::StoreUnavailable);
+                if !*fetching && takes_key(provider) && mistyped_key && !store_failed {
+```
+
+- [ ] **Step 8:** `cargo test -p light-factory-tui`, `OPENAI_API_KEY=sk-test cargo test -p light-factory-tui`,
+      clippy, `cargo fmt --all`. Commit as `tui: carry the failure class into the connect modal`.
+
+---
+
+### Task 10: Make the messages actionable and the extension rules exhaustive
+
+Six findings from the review, all local, all in code round 1 wrote.
+
+**Files:** `crates/tui/src/provider.rs`, `crates/tui/src/selection.rs`, `crates/tui/src/text.rs`,
+`crates/tui/src/app.rs`, `crates/tui/src/i18n.rs`.
+
+- [ ] **Step 1: Failing tests**
+
+In `provider.rs`'s `mod tests`:
+
+```rust
+    /// The substituted line replaced one that named a remedy. A broken keyring is exactly when an
+    /// environment variable helps, so the replacement must not be a dead end.
+    #[test]
+    fn the_store_offline_notice_still_names_a_remedy() {
+        let mut info = info(Some(OfflineReason::NothingConfigured), None);
+        info.store_failures = vec![failure("openai")];
+        let line = info
+            .notices(Locale::En)
+            .pop()
+            .expect("an offline provider has an offline line");
+        assert!(line.contains("ANTHROPIC_API_KEY"), "no remedy named: {line}");
+    }
+
+    /// A dead D-Bus session fails every entry with the same words. One line per provider is four
+    /// rows saying one thing; collapse them while keeping the per-provider form when the causes
+    /// genuinely differ.
+    #[test]
+    fn identical_store_failures_collapse_to_one_line() {
+        let mut info = info(Some(OfflineReason::NothingConfigured), None);
+        info.store_failures = REMOTE_IDS
+            .iter()
+            .map(|id| StoreFailure { provider: id.to_string(), error: "no D-Bus session".into() })
+            .collect();
+        let notices = info.notices(Locale::En);
+        assert_eq!(notices.len(), 2, "one collapsed failure line plus the offline line: {notices:?}");
+        assert!(notices[0].contains("no D-Bus session"), "{notices:?}");
+    }
+
+    #[test]
+    fn differing_store_failures_are_reported_per_provider() {
+        let mut info = info(None, Some(SelectedBy::KeyPrecedence));
+        info.store_failures = vec![
+            StoreFailure { provider: "openai".into(), error: "locked".into() },
+            StoreFailure { provider: "gemini".into(), error: "no D-Bus session".into() },
+        ];
+        let notices = info.notices(Locale::En);
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().any(|n| n.contains("openai") && n.contains("locked")));
+        assert!(notices.iter().any(|n| n.contains("gemini") && n.contains("no D-Bus session")));
+    }
+```
+
+`REMOTE_IDS` lives in `crate::selection`; import it in the test module.
+
+In `text.rs`'s `mod tests`:
+
+```rust
+    /// `char::is_control` covers only the Cc block. U+202E and its neighbours are Cf: they survive
+    /// the filter and let a hostile error body control how a row *renders* independently of what it
+    /// says — the Trojan-Source shape, on a modal this repo already treats as a phishing surface.
+    #[test]
+    fn one_line_strips_bidi_and_invisible_formatting() {
+        for c in ['\u{202E}', '\u{2066}', '\u{200F}', '\u{FEFF}', '\u{2060}', '\u{200B}'] {
+            let rendered = one_line(&format!("a{c}b"));
+            assert_eq!(rendered, "ab", "U+{:04X} survived", c as u32);
+        }
+    }
+```
+
+In `selection.rs`'s `mod tests`:
+
+```rust
+    /// The cap belongs at the seam, not at one of the two consumers: the engine-log path never
+    /// capped, so a verbose keyring error reached it unbounded.
+    #[test]
+    fn read_store_bounds_a_verbose_failure() {
+        let store = FailingStore::new("x".repeat(10_000));
+        let Err(error) = read_store("openai", &store) else {
+            panic!("a failing store must not answer Ok");
+        };
+        assert!(error.chars().count() <= STORE_ERROR_MAX_CHARS + 1, "{}", error.chars().count());
+    }
+```
+
+- [ ] **Step 2:** `cargo test -p light-factory-tui` — expect FAIL.
+
+- [ ] **Step 3: Name a remedy in the store-caused offline line.** In `i18n.rs`, extend both
+      catalogs. EN:
+
+```rust
+    (
+        "provider.offline.store_unavailable",
+        "Falling back to the offline provider: the credential store could not be read, so stored keys were unavailable. Unlock it and restart, or set ANTHROPIC_API_KEY (or another provider's key) in the environment.",
+    ),
+```
+
+ES:
+
+```rust
+    (
+        "provider.offline.store_unavailable",
+        "Usando el proveedor sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales, as\u{ed} que las claves guardadas no estaban disponibles. Desbloqu\u{e9}alo y reinicia, o define ANTHROPIC_API_KEY (o la clave de otro proveedor) en el entorno.",
+    ),
+```
+
+Neither is a `*.footer` key, so the 58-column gate does not apply; both are body rows the engine log
+renders one per line.
+
+- [ ] **Step 4: Make the pairing rule exhaustive.** `OfflineReason` comes from another crate and is
+      not `#[non_exhaustive]`, so a `matches!` lets a future variant answer this question silently —
+      while its sibling `offline_notice` right below already matches exhaustively. In
+      `ProviderInfo::notices`:
+
+```rust
+        if let Some(reason) = &self.offline {
+            let store_caused = !self.store_failures.is_empty()
+                && match reason {
+                    // The store is the only reason here that can be *why* `keys` is empty.
+                    OfflineReason::NothingConfigured => true,
+                    // These carry their own cause; overwriting one would repeat the defect this
+                    // exists to fix, in the other direction. The failure is already on its own
+                    // line above.
+                    OfflineReason::NamedProviderMissingKey { .. }
+                    | OfflineReason::BaseUrlRejected { .. } => false,
+                };
+```
+
+Also soften the doc comment's "unambiguously": with an unreadable store you cannot know whether a
+key existed, so the honest claim is that this is the one reason where the alternative notice would
+be a lie.
+
+- [ ] **Step 5: Collapse identical failures.** In `ProviderInfo::notices`, replace the per-failure
+      loop:
+
+```rust
+        // A locked wallet or a dead session bus fails every entry with the same words, so the
+        // per-provider form would be four rows saying one thing. Keep it only when the causes
+        // actually differ, which is the partial failure `KeyringStore`'s per-entry reads allow.
+        match self.store_failures.split_first() {
+            None => {}
+            Some((first, rest)) if rest.iter().all(|f| f.error == first.error) => {
+                lines.push(i18n::t_with(
+                    locale,
+                    "provider.store.unavailable_all",
+                    &[("error", &first.error)],
+                ));
+            }
+            Some(_) => {
+                for failure in &self.store_failures {
+                    lines.push(i18n::t_with(
+                        locale,
+                        "provider.store.unavailable",
+                        &[("provider", &failure.provider), ("error", &failure.error)],
+                    ));
+                }
+            }
+        }
+```
+
+Add `provider.store.unavailable_all` to both catalogs — EN `"Could not read the credential store:
+{error}"`, ES `"No se pudo leer el almac\u{e9}n de credenciales: {error}"`.
+
+Note the single-failure case takes the collapsed branch too (`rest` is empty), which reads correctly:
+one provider failing with one cause is still "could not read the credential store". If a test wants
+the provider named for a lone failure, use the differing-causes branch instead.
+
+- [ ] **Step 6: Cap the store error at the seam.** `read_store`'s comment claims "the length cap
+      belongs to the modal, which already owns it" — true of the `/models` consumer and false of the
+      `apply_preferences` → `notices` → engine-log consumer, which never capped. Fix the code, not
+      the comment:
+
+```rust
+/// The longest store-failure text any consumer renders. The engine log clips rather than wraps, so
+/// an uncapped line loses its tail silently; the modal has its own, tighter cap on top.
+const STORE_ERROR_MAX_CHARS: usize = 160;
+```
+
+```rust
+fn read_store(provider: &str, store: &dyn CredentialStore) -> Result<Option<String>, String> {
+    store
+        .get(provider)
+        .map_err(|e| truncate_chars(&one_line(&format!("{e:#}")), STORE_ERROR_MAX_CHARS))
+}
+```
+
+Import `truncate_chars` alongside `one_line`, and rewrite the doc comment's last sentence to say the
+cap is applied here so both consumers inherit it, with the modal narrowing it further.
+
+- [ ] **Step 7: Strip bidi and invisible formatting in `one_line`.**
+
+```rust
+/// Whether `c` can reorder or hide neighbouring text without occupying a cell of its own.
+///
+/// `char::is_control` covers only the Cc block; the bidi overrides and isolates are Cf and pass
+/// straight through it. A remote error body containing U+202E controls how the row *renders*
+/// independently of what it says, which is the Trojan-Source spoofing shape.
+fn is_invisible_formatting(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{FEFF}')
+}
+```
+
+and in `one_line`, `.filter(|c| !c.is_control() && !is_invisible_formatting(*c))`.
+
+While here, correct `one_line`'s doc: the unbounded-block hazard is the **engine log**, whose
+`ListItem::new(String)` builds a `Text` that splits on `.lines()`. The modal renders a `Line`, which
+does not split — its hazard is length, which `truncate_chars` handles.
+
+- [ ] **Step 8: Give the store *write* paths the same hygiene as the read path.** Four sites in
+      `app.rs` stringify a store error with `e.to_string()` and no `one_line`: the `/key` submit, the
+      connect key-entry submit, and `clear_key`. `e.to_string()` reports only the outermost message,
+      dropping the source chain `read_store` goes out of its way to keep, and the untrimmed text
+      reaches a rendered `Line`. At each, use:
+
+```rust
+                let error = crate::text::one_line(&format!("{e:#}"));
+```
+
+- [ ] **Step 9:** `cargo test -p light-factory-tui`, `OPENAI_API_KEY=sk-test cargo test -p light-factory-tui`,
+      `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all`. Commit as
+      `tui: make the store-failure notices actionable and bound them at the seam`.
+
+---
+
+### Task 11: Close the test gaps and correct six comments
+
+Two state mappings are covered only by negative assertions that would pass if wired to the wrong
+state, one test genuinely fails under a fully-populated environment, and six comments make claims the
+code does not support.
+
+**Files:** `crates/tui/src/app.rs`, `crates/tui/src/selection.rs`, `crates/tui/src/modal.rs`,
+`crates/tui/src/text.rs`, `crates/tui/src/i18n.rs`, `crates/tui/src/credentials.rs`.
+
+- [ ] **Step 1: Strict, env-independent assertions for the two `App` mappings.** `ollama` and
+      `local` declare no env var (`env_key_var` returns `None`), so `env_key` cannot answer and only
+      the store can — the same trick this branch already uses twice. That makes a strict positive
+      assertion available with no production change and no env dependence. In `app.rs`'s `mod tests`,
+      **replace** `the_key_listing_never_reports_an_unreadable_store_as_no_key` and
+      `provider_rows_never_report_an_unreadable_store_as_having_no_key` with:
+
+```rust
+    /// Wire the `Unavailable` arm to `provider.key.keyring` and the old negative assertion still
+    /// passed — `/key` would report a live keyring for a dead one. `ollama` declares no env var, so
+    /// `process_env` cannot decide this and the assertion can be strict.
+    #[test]
+    fn an_unreadable_store_is_labelled_unavailable() {
+        let app = test_app_with_store(Arc::new(
+            light_factory_tui::credentials::FailingStore::default(),
+        ));
+        assert_eq!(
+            app.key_status_label("ollama"),
+            app.t("provider.key.unavailable")
+        );
+    }
+
+    /// Map `Unavailable` to `Present` and the old negative assertion still passed — the row would
+    /// read "openai (connected)" for a store that cannot be read, which is worse than the bug this
+    /// fixes. Asserted on `openai` as a negative (the ambient env can make it `Present`) and on a
+    /// keyless id as a positive.
+    #[test]
+    fn provider_rows_report_an_unreadable_store() {
+        let app = test_app_with_store(Arc::new(
+            light_factory_tui::credentials::FailingStore::default(),
+        ));
+        let rows = app.build_provider_rows();
+        let openai = rows.iter().find(|r| r.id == "openai").expect("listed");
+        assert_ne!(openai.key, RowKey::Absent);
+
+        // Ollama takes no API key, so a broken store must never label it "key store unavailable" —
+        // the special case in `build_provider_rows` had no test at all.
+        let ollama = rows.iter().find(|r| r.id == "ollama").expect("listed");
+        assert_ne!(ollama.key, RowKey::Unavailable);
+    }
+```
+
+- [ ] **Step 2: Make `rebuild`'s test env-independent.** `rebuild_carries_store_failures_into_the_provider_info`
+      genuinely FAILS with all four provider keys exported — reproduced by a reviewer — and its
+      `!is_empty()` assertion never checks which provider or which cause survived. Its doc comment
+      frames this as the same caveat the `App`-level tests carry, which is backwards: those are
+      written with `assert_ne!` precisely so they hold either way.
+
+      Give the startup path the seam `key_status_with` already has. In `selection.rs`, split
+      `build_selection` the way `resolve_key` is split:
+
+```rust
+/// Assemble the effective [`Selection`] from an explicit base, plus any store failure encountered.
+/// The base is supplied so a test can pin the outcome without the process environment deciding it.
+fn build_selection_from(
+    base: Selection,
+    settings: &Settings,
+    store: &dyn CredentialStore,
+) -> (Selection, Vec<StoreFailure>) {
+    apply_preferences(base, settings, store)
+}
+
+/// The effective [`Selection`] for the running process: the environment, then the stored keys and
+/// persisted preferences layered on top.
+pub fn build_selection(
+    settings: &Settings,
+    store: &dyn CredentialStore,
+) -> (Selection, Vec<StoreFailure>) {
+    build_selection_from(selection_from_env(), settings, store)
+}
+```
+
+      and the same for `rebuild` / `rebuild_from`. Then rewrite the test against `rebuild_from` with
+      an explicit empty base and assert what actually survives:
+
+```rust
+    /// Driven from an explicit base so the process environment cannot decide the outcome: with all
+    /// four provider keys exported the ambient form silently recorded no failures at all.
+    #[test]
+    fn rebuild_carries_store_failures_into_the_provider_info() {
+        let broken = FailingStore::new("no D-Bus session");
+        let (_provider, info) = rebuild_from(Selection::default(), &settings(None), &broken);
+        assert_eq!(info.store_failures.len(), REMOTE_IDS.len());
+        assert!(info.store_failures.iter().all(|f| f.error == "no D-Bus session"));
+        assert!(info.store_failures.iter().any(|f| f.provider == "openai"));
+    }
+```
+
+      `main.rs` and `app.rs` keep calling `rebuild`, so neither needs an edit — confirm that.
+
+- [ ] **Step 3: Render the store-failure credentials step end to end.** The existing
+      `the_credentials_step_renders_the_remedy_and_no_input_box` covers the `Auth` class and exists
+      because a long real message once pushed the remedy off screen (#57). `StoreUnavailable`'s
+      message is the composed sentence *plus* the keyring's own text — a longer line hitting the same
+      sizing path — and has no equivalent. Add the mirror test in `app.rs`, driving
+      `handle_models_fetched` with a realistic ~110-character store error, rendering at 80x20, and
+      asserting the remedy text and the provider are both on screen and `/key` is not.
+
+- [ ] **Step 4: Pin the modal's cap on the store path.** Remove `summarize_provider_error` from
+      `fetch_model_list_inner` today and every test still passes. In `modal.rs`:
+
+```rust
+    /// The composed sentence carries the keyring's own text, which a hostile or merely verbose
+    /// backend controls the length of. Uncapped it displaces the modal's own remedy row.
+    #[tokio::test]
+    async fn a_verbose_store_error_is_capped_before_it_reaches_the_modal() {
+        let store = light_factory_tui::credentials::FailingStore::new("x".repeat(1000));
+        let err = fetch_model_list("local", None, &store, Locale::En)
+            .await
+            .expect_err("an unreadable store cannot produce a model list");
+        assert!(err.message.chars().count() <= PROVIDER_ERROR_MAX_CHARS + 1);
+        assert!(err.message.contains("local"), "the provider survives the cut: {}", err.message);
+    }
+```
+
+- [ ] **Step 5a: Restore the remedy-text guard Task 8 left unowned.** Deleting
+      `a_store_failure_gets_its_own_remedy` dropped the only assertion that the store remedy's *text*
+      names the provider and mentions neither `/key` nor `/connect` — the whole point of it being a
+      separate remedy. `models.store_remedy` is now guarded only by the catalog's existence and
+      mirroring tests, so that string could be edited to recommend `/connect` and nothing would
+      object. Add to `modal.rs`'s `every_credential_class_names_its_own_remedy`:
+
+```rust
+        let store = i18n::t_with(
+            Locale::En,
+            FetchFailure::StoreUnavailable.remedy_key().expect("a credential class"),
+            &[("provider", "openai")],
+        );
+        assert!(store.contains("openai"), "the remedy names the provider: {store}");
+        assert!(
+            !store.contains("/key") && !store.contains("/connect"),
+            "both write to the store that just failed: {store}"
+        );
+```
+
+- [ ] **Step 5: One more wiring assertion.** In `selection.rs`'s
+      `key_status_with_classifies_every_wiring_outcome`, add the composition the two new rules leave
+      untested — an empty env value falling through to a *broken* store:
+
+```rust
+        assert_eq!(key_status_with("openai", &broken, blank), KeyStatus::Unavailable);
+```
+
+- [ ] **Step 6: Correct six comments that make claims the code does not support.**
+
+  1. `app.rs`, the store-failure routing test: drop the hardcoded `app.rs:2147` — the `open` helper
+     is not at that line, and line numbers in comments rot on the next edit. Say "that is what the
+     `open` helper above exists for".
+  2. `selection.rs` `read_store`: Task 10 Step 6 applies the cap here, so replace "the length cap
+     belongs to the modal, which already owns it" with a statement that the cap is applied at the
+     seam and the modal narrows it further.
+  3. `selection.rs` `rebuild_carries_store_failures_into_the_provider_info`: Task 11 Step 2 removes
+     the env dependence, so delete the caveat paragraph entirely and say why the base is explicit.
+  4. `app.rs` `build_provider_rows`: "`LIGHT_OLLAMA` is the whole of its configuration" is false —
+     `crates/providers` also reads `LIGHT_OLLAMA_MODEL`. Keep only the load-bearing half: ollama
+     takes no API key, so the credential store is never consulted for it.
+  5. `text.rs` `one_line`: Task 10 Step 7 rewrites this. The newline hazard is the engine log's
+     `Text` split, not the modal's `Line`.
+  6. `modal.rs`, above the `Credentials` render arm: "the remote-supplied error" is now wrong — this
+     arm also renders `StoreUnavailable`, whose text comes from the OS credential store, and
+     `MissingKey`, whose text is our own i18n string. Say "the foreign error text (a provider's or
+     the credential store's)".
+
+  Also, where it is one clause: note on `SetFailsStore` why it is not the library's `FailingStore`
+  (it needs `get` to succeed while `set` fails, a shape `FailingStore` cannot produce); name
+  `draw_popup` as the source of the i18n width test's `58` and say the provider id is duplicated by
+  hand from `app.rs`; and rename `resolve_key_delegates_to_the_process_env_reader`, whose own doc
+  says `process_env` is never consulted, to `resolve_key_reads_the_store_for_a_provider_with_no_env_var`.
+
+- [ ] **Step 7:** `cargo test -p light-factory-tui`,
+      `OPENAI_API_KEY=sk-test cargo test -p light-factory-tui`, and
+      `ANTHROPIC_API_KEY=a OPENAI_API_KEY=b GEMINI_API_KEY=c DEEPSEEK_API_KEY=d cargo test -p light-factory-tui`
+      — all three must pass, the third being the one that fails today. Then `cargo test --workspace`,
+      clippy, `cargo fmt --all`. Commit as
+      `tui: pin the store-failure state mappings and drop the tests' environment dependence`.
+
+---
+
+# Round 3 — findings from the round-2 re-review
+
+Three reviewers (silent-failure, architect, blind-diff security) converged independently on the same
+three blocking defects. One of them was demonstrated empirically with a real ratatui render, not
+argued from reading — that is the one to take most seriously, because round 2 *believed* it had
+fixed it.
+
+### Task 12: Fix the three defects round 2 introduced or failed to close
+
+**Files:** `crates/tui/src/i18n.rs`, `crates/tui/src/provider.rs`, `crates/tui/src/app.rs`.
+
+#### 12A — The remedy round 2 added is invisible. `draw_engine` clips; it does not wrap.
+
+Round 2 appended "Unlock it and restart, or set ANTHROPIC_API_KEY …" to
+`provider.offline.store_unavailable`, taking it to 206 characters (EN) / 228 (ES), with the remedy
+starting at offset 111 / 131. Its only consumer is `engine_log`, rendered as `ListItem::new(String)`
+in a ratatui `List`, which **truncates** — a fact `selection.rs`'s own comment already asserts. A
+reviewer rendered it at 80 columns and got the sentence cut mid-clause, with no ellipsis, and
+`contains("ANTHROPIC_API_KEY") == false`.
+
+So the round-1 finding is not fixed; it is re-created one clause later. And
+`the_store_offline_notice_still_names_a_remedy` passes because it asserts on the **string**, not on
+the render — the same mistake in the test as in the fix.
+
+- [ ] Split the remedy into its own catalog entry and push it as its own line, so the list gives it a
+      row. Keep every new line under ~58 characters in **both** locales, the width the popup gate
+      already treats as the safe budget.
+
+```rust
+        if let Some(reason) = &self.offline {
+            let store_caused = /* unchanged */;
+            if store_caused {
+                lines.push(i18n::t(locale, "provider.offline.store_unavailable").to_string());
+                lines.push(i18n::t(locale, "provider.offline.store_remedy").to_string());
+            } else {
+                lines.push(offline_notice(locale, reason));
+            }
+        }
+```
+
+      EN: `provider.offline.store_unavailable` → `"Offline: the credential store could not be read."`;
+      `provider.offline.store_remedy` → `"Unlock it and restart, or set a provider's API key in the environment."`
+      ES: `"Sin conexi\u{f3}n: no se pudo leer el almac\u{e9}n de credenciales."` and
+      `"Desbloqu\u{e9}alo y reinicia, o define la clave de API de un proveedor en el entorno."`
+
+- [ ] **Assert on the render, not the string.** Add a test that drives `draw_engine` through a
+      `TestBackend::new(80, 12)` and asserts the remedy text is actually present in the buffer.
+      Without it this regresses the moment someone lengthens a line. Follow the existing
+      `draw_to_text` helper's shape.
+
+- [ ] **Guard the whole catalog, not just this key.** The existing
+      `every_footer_fits_the_popup_in_both_locales` gates `*.footer` only. Add a sibling gating every
+      `provider.offline.*` and `provider.store.*` key at 58 columns in both locales, with a comment
+      naming `draw_engine`'s `List` as the reason.
+
+#### 12B — `offline_models_step` asserts the store is the cause when it may not be, and names a provider the user never chose
+
+Two defects in one function, flagged by all three reviewers.
+
+*It never reads `offline`.* Ten lines away, `ProviderInfo::notices` was hardened in round 2 to branch
+exhaustively on `OfflineReason` precisely so it would not overwrite another cause — and
+`offline_models_step` does exactly that overwrite. With a rejected `*_BASE_URL` **and** a locked
+keyring, `/models` tells the user to unlock the credential store, which cannot help.
+
+*It takes `store_failures.first()`.* In the headline scenario all four `REMOTE_IDS` fail, so `first()`
+is always `anthropic`. A user on DeepSeek reads a sentence about Anthropic, and Ctrl+R retries
+Anthropic. The existing test plants a **single** `openai` failure, so it never sees this.
+
+- [ ] Put the predicate on `ProviderInfo`, where both fields live, and drive both consumers from it:
+
+```rust
+    /// The store failures, but only when the store is why there is no key.
+    ///
+    /// `notices` and `/models` both have to answer this, and answering it twice is how they drifted
+    /// apart: one branched exhaustively on the reason, the other ignored it entirely.
+    pub fn store_caused_offline(&self) -> &[StoreFailure] {
+        match self.offline {
+            Some(OfflineReason::NothingConfigured) => &self.store_failures,
+            Some(OfflineReason::NamedProviderMissingKey { .. } | OfflineReason::BaseUrlRejected { .. })
+            | None => &[],
+        }
+    }
+```
+
+- [ ] `offline_models_step` uses it, and names the provider the user is actually trying to reach
+      (`self.provider_info.id`) rather than `REMOTE_IDS[0]`, collapsing the message the same way
+      `notices` does when every cause matches.
+- [ ] Add the test the existing one is missing: plant a failure for **all four** `REMOTE_IDS` and
+      assert the step does not name a provider the user never chose.
+- [ ] Add a test that a non-`NothingConfigured` offline reason plus a store failure yields
+      `ModelsStep::Offline`, not the store step.
+
+#### 12C — A lone store failure is reported as a whole-store failure, and an assertion was weakened to allow it
+
+`split_first()` on a one-element vec leaves `rest` empty, so `rest.iter().all(..)` is vacuously true
+and a **single** failure takes the collapsed "Could not read the credential store" branch, dropping
+the provider name. `KeyringStore` reads per entry, so exactly one provider's item failing is a real
+state — and it is the case where naming the provider matters most.
+
+Round 2 weakened `a_store_failure_replaces_the_nothing_configured_notice` from
+`n.contains("openai") && n.contains("locked")` to `n.contains("locked")` to accommodate this. A test
+relaxed to fit an implementation is the smell; three reviewers named it independently.
+
+- [ ] Match on the slice so the lone case is explicit, and restore the original assertion:
+
+```rust
+        match self.store_failures.as_slice() {
+            [] => {}
+            [only] => lines.push(i18n::t_with(
+                locale,
+                "provider.store.unavailable",
+                &[("provider", &only.provider), ("error", &only.error)],
+            )),
+            [first, rest @ ..] if rest.iter().all(|f| f.error == first.error) => lines.push(
+                i18n::t_with(locale, "provider.store.unavailable_all", &[("error", &first.error)]),
+            ),
+            all => {
+                for failure in all {
+                    lines.push(i18n::t_with(
+                        locale,
+                        "provider.store.unavailable",
+                        &[("provider", &failure.provider), ("error", &failure.error)],
+                    ));
+                }
+            }
+        }
+```
+
+- [ ] Run all three environment variants, clippy, fmt. Commit as
+      `tui: report the real cause and the real provider when the store fails`.
+
+---
+
+### Task 13: Close the text-hygiene gaps
+
+**Files:** `crates/tui/src/text.rs`, `crates/tui/src/selection.rs`, `crates/tui/src/app.rs`.
+
+- [ ] **Test the general category, not an enumerated range list.** The round-2 predicate misses
+      U+061C (ARABIC LETTER MARK — a UAX #9 bidi control in the same family as LRM/RLM), the
+      `U+206A..206F` format controls, and the **Unicode tag block `U+E0000..E007F`**, which encodes
+      arbitrary ASCII in zero visible columns. That last one matters here specifically: this text
+      lands in a scrollback the user is invited to copy and paste, in an application whose purpose is
+      piping text to an LLM. Enumerating ranges loses this race one block at a time.
+
+      Keep the function name and doc, and widen the predicate to cover the Cf general category plus
+      the line/paragraph separators `U+2028`/`U+2029` (which `str::lines` does not split on, so they
+      survive `one_line` into a cell). If pulling in a `unicode-general-category` dependency is not
+      warranted for one predicate, enumerate the Cf blocks exhaustively and say in the doc that the
+      list is the Cf category as of Unicode 16, so the next reader knows the maintenance rule.
+      Extend the existing test to cover U+061C, U+E0001, U+2028, and U+00AD.
+
+- [ ] **Cap the `set`/`delete` errors too.** Round 2 gave three write paths `one_line` but not
+      `truncate_chars`, while `read_store` caps `get`. Same untrusted source, same rendering surface.
+      Add a `pub(crate) fn store_error(e: &anyhow::Error) -> String` next to `read_store` that does
+      `truncate_chars(&one_line(&format!("{e:#}")), STORE_ERROR_MAX_CHARS)`, and route all four seams
+      through it — one helper, no seam left out.
+
+- [ ] **Guard the empty case.** Nothing checks whether the reduced text is empty, and round 2 widened
+      the set of inputs that can reduce to nothing. The user then reads "Could not read the credential
+      store: " with a dangling colon and nothing to paste into a bug report. Inside `store_error`,
+      fall back to a sentinel that says the cause was unprintable rather than rendering emptiness.
+
+- [ ] **`/models`' offline path must log.** `handle_models_fetched` calls `push_log` with the stated
+      rationale that "the modal is not a record: Esc would erase the only copy of the failure."
+      `offline_models_step`, added in round 2, does not. A user who opens `/models`, reads the store
+      error, and presses Esc is left with it on no surface at all. Have `enter_models` push the
+      composed error to the log when it routes to the store step.
+
+- [ ] Three environment variants, clippy, fmt. Commit as
+      `tui: bound and record every store error the user can be shown`.
+
+---
+
+### Task 14: Stop `/connect` telling the user to run `/connect`
+
+**Files:** `crates/tui/src/modal.rs`.
+
+`connect_view` renders `failure.and_then(FetchFailure::remedy_key)` for **every** credential class.
+For `Auth` and `MissingKey` that key is `models.credentials_remedy` — *"Use /connect, /key {provider},
+or /model <id>"* — rendered to a user standing inside the `/connect` modal, pointing at `/connect`,
+and naming a manual-entry step `ConnectStep` does not have. Task 9's motivation was the store class;
+the implementation generalized past it, and no test covers `Auth` or `MissingKey` through
+`connect_view`, which is why the wording slipped.
+
+The remedy is not a function of the class alone — it depends on where the user is standing.
+
+- [ ] Make that second dimension explicit rather than implicit:
+
+```rust
+/// Where a remedy is being rendered. The right advice depends on it: `/connect` must not tell a user
+/// already inside `/connect` to run `/connect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    Models,
+    Connect,
+}
+
+impl FetchFailure {
+    pub(crate) fn remedy_key(self, surface: Surface) -> Option<&'static str> {
+        match (self, surface) {
+            (FetchFailure::StoreUnavailable, _) => Some("models.store_remedy"),
+            (FetchFailure::MissingKey | FetchFailure::Auth, Surface::Models) => {
+                Some("models.credentials_remedy")
+            }
+            // Inside `/connect` the user is already on the remedy; the key field is one Esc away.
+            (FetchFailure::MissingKey | FetchFailure::Auth, Surface::Connect) => None,
+            (FetchFailure::Fetch, _) => None,
+        }
+    }
+}
+```
+
+      `needs_credentials` becomes `self.remedy_key(Surface::Models).is_some()`, which preserves its
+      current meaning exactly — it is a routing question about the models modal.
+
+- [ ] Add the tests whose absence let this through: `Auth` and `MissingKey` rendered through
+      `connect_view` offer no remedy row, while `StoreUnavailable` does.
+- [ ] Three environment variants, clippy, fmt. Commit as
+      `tui: make the credential remedy depend on the surface it is shown on`.
+
+## Deviations in Task 12 as implemented
+
+- **The plan's own remedy strings broke the plan's own 58-column gate** (70 EN / 79 ES). Shipped
+  `"Unlock it and restart, or set ANTHROPIC_API_KEY."` (48) and the ES equivalent (52) — concrete,
+  fits, and keeps the token the reviewer's render probe asserts on.
+- **The new width gate exposed two pre-existing over-budget keys**, so they were shortened in both
+  locales: `provider.offline.nothing` (EN 92 → 57) and `provider.offline.missing_key` (EN 77 → 49).
+  EN 92 exceeded even the 78 usable columns of an 80-column engine list, so this was the same defect
+  already shipped. `nothing` lost its "(or another provider's key)" parenthetical.
+- **`offline_models_step` does not use `provider_info.id`**, contrary to the task's checkbox: once the
+  offline fallback has happened that id is `"local"`, which never matches a `StoreFailure` and would
+  render "set local's API key". It uses the same slice-collapse rule as `notices` instead — one
+  failure names its provider, several name none.
+- **`models.store_remedy` no longer interpolates `{provider}`**, because the collapsed branch was
+  still rendering "set anthropic's API key" for a store that failed for everyone. The render
+  assertion caught it.
+- The 58-column budget is justified by `models_view` rendering `offline_notice` into `draw_popup`'s
+  box, **not** by `draw_engine` (whose list is 78 columns at 80). The task's stated rationale was
+  wrong; the narrower number is still the right one.
+
+Known, accepted, and recorded rather than fixed: Ctrl+R on the collapsed branch still re-fetches
+`store_failures[0]`. Nothing rendered names it, and the fetch does re-read the store, so it is the
+provider key precedence would pick once the store answers — but it is not literally the provider the
+user chose, and saying so would need `ModelsStep::Credentials.provider` to become an `Option`.
