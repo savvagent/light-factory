@@ -59,7 +59,8 @@ pub struct Selection {
     /// The persisted provider preference (`"anthropic"`|`"openai"`|`"gemini"`|`"deepseek"`|
     /// `"ollama"`).
     pub preferred: Option<String>,
-    /// Resolved, non-empty API keys by provider id (env wins over keyring, decided by the caller).
+    /// Resolved, trimmed non-empty API keys by provider id (env wins over keyring, decided by
+    /// the caller).
     pub keys: HashMap<String, String>,
     /// Model overrides by provider id (`"ollama"` included), merged env-over-persisted by the
     /// caller.
@@ -94,6 +95,29 @@ pub fn env_key_var(provider: &str) -> Option<&'static str> {
         "deepseek" => Some("DEEPSEEK_API_KEY"),
         _ => None,
     }
+}
+
+/// An env-supplied key is usable only after stripping surrounding whitespace (a trailing
+/// newline from `$(cat keyfile)` must not reach a Bearer header); a whitespace-only value is
+/// treated as absent.
+fn normalize_env_key(raw: String) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Collect the env-supplied keys by provider id, applying [`normalize_env_key`] uniformly.
+/// Pure: `read` supplies variable values so the mapping (`env_key_var` naming → normalization →
+/// map insertion) is testable without the process env.
+fn keys_from(read: impl Fn(&str) -> Option<String>) -> HashMap<String, String> {
+    let mut keys = HashMap::new();
+    for id in ["anthropic", "openai", "gemini", "deepseek"] {
+        if let Some(var) = env_key_var(id)
+            && let Some(key) = read(var).and_then(normalize_env_key)
+        {
+            keys.insert(id.to_string(), key);
+        }
+    }
+    keys
 }
 
 /// A provider built from explicit inputs, plus its effective model id (for display).
@@ -542,15 +566,7 @@ pub fn build_provider(selection: &Selection) -> BuiltProvider {
 
 /// Read the `Selection` from the process environment (no keyring, no persisted preference).
 pub fn selection_from_env() -> Selection {
-    let mut keys = HashMap::new();
-    for id in ["anthropic", "openai", "gemini", "deepseek"] {
-        if let Some(var) = env_key_var(id)
-            && let Ok(key) = std::env::var(var)
-            && !key.is_empty()
-        {
-            keys.insert(id.to_string(), key);
-        }
-    }
+    let keys = keys_from(|var| std::env::var(var).ok());
 
     let mut models = HashMap::new();
     if let Ok(model) = std::env::var("LIGHT_OLLAMA_MODEL")
@@ -963,5 +979,88 @@ mod tests {
         // id is one of the known provider ids, never the offline state.
         let built = build_provider_from_env();
         assert!(!built.provider.id().is_empty());
+    }
+
+    /// An env-supplied key must be usable only after stripping surrounding whitespace (a
+    /// trailing newline from `$(cat keyfile)` must not reach a Bearer header).
+    #[test]
+    fn normalize_env_key_trims_surrounding_whitespace() {
+        assert_eq!(
+            normalize_env_key("  sk-1\n".to_string()),
+            Some("sk-1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_env_key_keeps_a_clean_value_verbatim() {
+        assert_eq!(
+            normalize_env_key("sk-1".to_string()),
+            Some("sk-1".to_string())
+        );
+    }
+
+    /// A whitespace-only value carries no key: treat it as absent, not as configured.
+    #[test]
+    fn normalize_env_key_treats_a_whitespace_only_value_as_absent() {
+        assert_eq!(normalize_env_key(" \t\r\n".to_string()), None);
+    }
+
+    #[test]
+    fn normalize_env_key_treats_an_empty_value_as_absent() {
+        assert_eq!(normalize_env_key(String::new()), None);
+    }
+
+    /// Only *surrounding* whitespace is stripped; internal spacing is part of the value.
+    #[test]
+    fn normalize_env_key_preserves_internal_whitespace() {
+        assert_eq!(
+            normalize_env_key("abc def ".to_string()),
+            Some("abc def".to_string())
+        );
+    }
+
+    /// The mapping (`env_key_var` naming → normalization → map insertion) must flow through for
+    /// all four declared ids — and, since those ids are hardcoded inside `keys_from`, a counting
+    /// stub proves `read` is consulted exactly once per declared variable, never for anything else.
+    #[test]
+    fn keys_from_reads_only_the_declared_vars() {
+        let keys = keys_from(|var| Some(format!("k-{var}")));
+        assert_eq!(keys.len(), 4);
+        assert_eq!(
+            keys.get("anthropic"),
+            Some(&"k-ANTHROPIC_API_KEY".to_string())
+        );
+        assert_eq!(keys.get("openai"), Some(&"k-OPENAI_API_KEY".to_string()));
+        assert_eq!(keys.get("gemini"), Some(&"k-GEMINI_API_KEY".to_string()));
+        assert_eq!(
+            keys.get("deepseek"),
+            Some(&"k-DEEPSEEK_API_KEY".to_string())
+        );
+
+        let reads = std::cell::Cell::new(0u32);
+        let counting = |_: &str| {
+            reads.set(reads.get() + 1);
+            None
+        };
+        assert!(keys_from(counting).is_empty());
+        assert_eq!(reads.get(), 4);
+    }
+
+    #[test]
+    fn keys_from_treats_a_whitespace_only_env_value_as_absent() {
+        let keys = keys_from(|var| match var {
+            "OPENAI_API_KEY" => Some("   \n".to_string()),
+            _ => None,
+        });
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn keys_from_trims_a_trailing_newline_before_inserting() {
+        let keys = keys_from(|var| match var {
+            "ANTHROPIC_API_KEY" => Some("sk-a\n".to_string()),
+            _ => None,
+        });
+        assert_eq!(keys.get("anthropic"), Some(&"sk-a".to_string()));
     }
 }
