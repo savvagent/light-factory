@@ -6,13 +6,14 @@
 treated as absent — the same rule the interactive `/key` path already enforces — so selection never
 sends a whitespace-padded credential and never reports a whitespace-only one as configured.
 
-**Architecture:** One private normalization helper per crate, applied at each crate's single
+**Architecture:** One private normalization point per crate, applied at each crate's single
 env-entry point for keys. In `crates/providers/src/selection.rs`, `keys_from(read)` collects the
 four `*_API_KEY` variables through an injectable reader and routes every raw value through
 `normalize_env_key`; `selection_from_env` delegates its key loop to it. In `crates/tui/src/selection.rs`,
-`classify` and `resolve_key_from` switch their presence filter from `!k.is_empty()` to
-`!k.trim().is_empty()` and `resolve_key_from` returns the trimmed value. Downstream surfaces
-(`fetch_model_list`, provider construction, the `/key` listing) change behavior without code edits.
+the #68-created seam `env_key(provider, env)` — already the single source of truth both
+`key_status_with` and `resolve_key_with` consult — gains a trim step so it returns the trimmed
+value or `None`. Downstream surfaces (`fetch_model_list`, provider construction, the `/key`
+listing) change behavior without code edits.
 
 **Tech Stack:** Rust (edition 2024, toolchain pinned by `rust-toolchain.toml`); std only — no new
 dependency, no new crate, no manifest change. Tests reuse each module's existing injectable-env
@@ -20,8 +21,10 @@ stub pattern; nothing calls `std::env::set_var`.
 
 **Spec:** `docs/superpowers/specs/2026-08-24-tui-env-key-trim-design.md` — read it first. This plan
 implements it exactly, including §3 Assumptions (trim = `str::trim`; trimmed value replaces the raw
-value downstream; internal whitespace preserved; classify keeps classifying by source) and §2 Scope
-Out (model/base-url env vars are a filed follow-up, not this PR).
+value downstream; internal whitespace preserved; classification keeps classifying by source) and
+§2 Scope Out (model/base-url env vars are a filed follow-up, not this PR). The spec's "Premise
+corrections" section is load-bearing: the TUI fix point is `env_key`, not the pre-#68
+`classify`/`resolve_key_from` pair.
 
 ## Global Constraints
 
@@ -48,7 +51,7 @@ Out (model/base-url env vars are a filed follow-up, not this PR).
 | File | Responsibility |
 |---|---|
 | Modify. `crates/providers/src/selection.rs` | Private `normalize_env_key` + `keys_from(read)`; `selection_from_env`'s key loop delegates to them; `Selection.keys` field doc updated to "trimmed, non-empty"; new unit + wiring tests |
-| Modify. `crates/tui/src/selection.rs` | `classify` and `resolve_key_from` apply the trim rule; rule comments updated; extended pure + wiring-level tests |
+| Modify. `crates/tui/src/selection.rs` | `env_key` applies the trim rule (both consumers inherit); rule comment updated; extended seam + wiring tests |
 | Create. `docs/superpowers/specs/2026-08-24-tui-env-key-trim-design.md` | Committed design spec (already on this branch) |
 | Modify. `docs/superpowers/plans/2026-08-24-tui-env-key-trim.md` | This file — checkboxes marked at close-out |
 
@@ -61,10 +64,12 @@ contract that Task 2's downstream narrative depends on; after it alone lands, pr
 already treats a whitespace-only env key as absent, so a bisect between the commits holds a correct
 (if incompletely classified) system.
 
-**Task 2 (tui) second** because `classify`/`resolve_key_from` are presentation-and-resolution-layer
-concerns (`/key` listing truthfulness, which key `fetch_model_list` sends) layered on top of the
-same rule; landing them separately keeps each commit's diff single-crate and independently
-revertable.
+**Task 2 (tui) second** because `env_key` feeds presentation-and-resolution concerns (`/key`
+listing truthfulness, which key `fetch_model_list` sends) layered on top of the same rule; landing
+them separately keeps each commit's diff single-crate and independently revertable.
+
+Each task ends gate-clean on its own (tests + clippy + fmt) so every intermediate commit is
+independently revertable without leaving a red bisect point.
 
 ### Task 1: Trim env-supplied keys in `crates/providers`
 
@@ -104,50 +109,56 @@ revertable.
       "Resolved, trimmed non-empty API keys by provider id (env wins over keyring, decided by the
       caller)". Change nothing else in the function — models and base_urls loops stay as they are.
 - [ ] Run `cargo test -p light-factory-providers` — all green, including the pre-existing suite.
+- [ ] Run `cargo clippy --workspace --all-targets -D warnings` — clean (the workspace still builds:
+      `selection_from_env`'s signature did not change).
 - [ ] Verify the no-public-API claim rather than remembering it:
       `grep -n "normalize_env_key\|keys_from" crates/providers/src/selection.rs` must show both
       declared **without** `pub`, and no other file in the workspace referencing either name.
 - [ ] Format and commit: `cargo fmt --all` then
       `git commit -m "providers: trim env-supplied api keys"`. No attribution trailer of any kind.
 
-### Task 2: Apply the same rule to `classify` / `resolve_key_from` in the TUI
+### Task 2: Apply the same rule to `env_key` in the TUI
 
 **Files:** `crates/tui/src/selection.rs`
 
 **Interfaces:**
 - *Consumes:* `str::trim`. Nothing new.
-- *Produces:* changed private fn bodies only (`classify`, `resolve_key_from`) plus updated rule
-  comments. All `pub fn` signatures (`key_status`, `resolve_key`, `apply_preferences`,
-  `build_selection`, `rebuild`) unchanged. **No public API change.**
+- *Produces:* a changed private fn body only (`env_key`) plus an updated rule comment. All `pub fn`
+  signatures (`key_status`, `resolve_key`, `apply_preferences`, `rebuild`) and all of #68's types
+  (`KeyStatus`, `KeyResolution`, `read_store`) are unchanged. **No public API change.**
+- *Why one site suffices:* both `key_status_with` (selection.rs:103) and `resolve_key_with`
+  (selection.rs:125) ask `env_key` first, so trimming there fixes status, resolution, and
+  fall-through semantics simultaneously; a whitespace-only env value makes the environment answer
+  "nothing usable" and the store is consulted exactly as for an unset variable.
 
 - [ ] Write the failing tests in `crates/tui/src/selection.rs`'s `#[cfg(test)] mod tests`:
-  - Extend `classify_distinguishes_env_keyring_and_none` with three cases:
-    `classify(Some(" \t\n".to_string()), Some("k".to_string())) == KeyStatus::Keyring`;
-    `classify(Some(" \t\n".to_string()), None) == KeyStatus::None`;
-    `classify(Some("  k  ".to_string()), None) == KeyStatus::Env` (padded-real stays `Env`).
-  - Rename `resolve_key_from_treats_an_empty_env_value_as_absent` to
-    `resolve_key_from_treats_a_blank_env_value_as_absent` and extend it: empty → keyring fallback
-    and → `None`; `" \n\t"` → keyring fallback and → `None`; and a new assertion pair proving the
-    trimmed value wins: `resolve_key_from(Some("sk-env\n".to_string()), Some("ring".to_string()))
-    == Some("sk-env".to_string())` (spec review round 1: the old name understated the rule it now
-    pins).
-  - Extend the wiring-level `resolve_key_with_treats_an_empty_env_value_as_absent` (or add a sibling
-    `resolve_key_with_trims_the_env_value`) : stub `|_| Some("  sk-env\n".to_string())` resolves
-    through `sources_with` to `Some("sk-env")`; stub `|_| Some("   ".to_string())` falls back to the
-    keyring value.
-  - Extend `key_status_with_classifies_every_wiring_outcome`: add a whitespace-only blank stub
-    (`Some(" \t\n".to_string())`) asserting `Keyring` against the populated store, and a
-    trailing-newline real-value stub (`Some("sk-env\n".to_string())`) asserting `Env` against the
-    empty store — the AC's two named cases through the public-shape wiring.
+  - Rename `env_key_treats_an_empty_value_as_absent` (selection.rs:242) to
+    `env_key_treats_a_blank_value_as_absent` and extend it — the empty/None assertions stay as-is,
+    add:
+    `assert_eq!(env_key("openai", |_| Some(" \t\n".to_string())), None);` (whitespace-only → absent)
+    and `assert_eq!(env_key("openai", |_| Some("  sk-env\n".to_string())), Some("sk-env".to_string()));`
+    (padded-real returns the **trimmed** value — this is the AC's trailing-newline case at the seam).
+  - Extend `key_status_with_classifies_every_wiring_outcome` (selection.rs:291):
+    with stub `blank_ws = |_: &str| Some(" \t\n".to_string())` assert
+    `key_status_with("openai", &ring, blank_ws) == KeyStatus::Keyring` (falls through to the stored
+    key) and `key_status_with("openai", &empty, blank_ws) == KeyStatus::None`; with stub
+    `padded = |_: &str| Some("  sk-env\n".to_string())` assert
+    `key_status_with("openai", &empty, padded) == KeyStatus::Env`.
+  - Rename `resolve_key_with_treats_an_empty_env_value_as_absent` (selection.rs:359) to
+    `resolve_key_with_treats_a_blank_env_value_as_absent`; keep the existing empty-string
+    assertion, then add: stub `|_| Some("   ".to_string())` still resolves the keyring value, and
+    stub `|_| Some("sk-env\n".to_string())` resolves
+    `KeyResolution::Found("sk-env".to_string())` — trimmed, not the raw value.
 - [ ] Run `cargo test -p light-factory-tui selection` — expect the new assertions to **fail**
-      (both fns still filter on bare `is_empty()`); the untouched pre-existing tests stay green.
-- [ ] Implement in `crates/tui/src/selection.rs` exactly as the spec's §2 shows:
-  - `classify`'s guard becomes `env_key.as_ref().is_some_and(|k| !k.trim().is_empty())`.
-  - `resolve_key_from` becomes the trim→filter→`or(keyring_key)` chain; update its doc comment from
-    "an empty env value is treated as absent (mirrors `classify`'s empty-string rule)" to the
-    whitespace rule, keeping the mirror statement accurate.
-- [ ] Run `cargo test -p light-factory-tui` — all green, including `modal`/`app` suites (they must be
-      unaffected: no signature changed).
+      (`env_key` still filters on bare `is_empty()`); every untouched pre-existing test stays green.
+- [ ] Implement in `crates/tui/src/selection.rs` exactly as the spec's §2 shows: `env_key` becomes
+      `env_key_var(provider).and_then(env).map(|k| k.trim().to_string()).filter(|k| !k.is_empty())`,
+      and its doc comment's "An empty value is treated as absent…" sentence becomes the whitespace
+      rule ("Surrounding whitespace is stripped; a value that is empty after trimming is treated as
+      absent"). Change nothing else — `key_status_with`, `resolve_key_with`, `read_store`, and the
+      `KeyResolution` machinery stay byte-for-byte identical.
+- [ ] Run `cargo test -p light-factory-tui` — all green, including the `modal`/`app` suites (they
+      must be unaffected: no signature changed).
 - [ ] Run `cargo test --workspace` and `cargo clippy --workspace --all-targets -D warnings` — both
       clean. (The persistence integration test skips without `DATABASE_URL`; documented
       pre-existing behavior, not a regression.)
