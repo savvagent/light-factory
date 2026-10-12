@@ -195,7 +195,11 @@ Operational facts for a fresh machine or session.
 - Fail-closed auth and fail-closed gates; no user enumeration; secrets never returned to
   clients; TOTP seeds and codes never logged.
 - `cargo fmt`, `cargo clippy -D warnings`, `cargo test` before calling a slice done.
-- Do not commit unless asked. No attribution/Co-Authored-By anywhere.
+- Commits: an interactive session does not commit unless asked. A development-workflow run
+  (`CLAUDE.md` § Development Workflow) commits on its own branch in its own worktree and
+  reaches `master` only through a merged PR. Nothing commits or pushes directly to `master`
+  except the version commit `bump.yml` makes when Rob cuts a release.
+  No attribution/Co-Authored-By anywhere.
 - On close-out, mark the spec `IMPLEMENTED`, tick the plan's steps, and `git mv` both into
   `docs/superpowers/archive/`. The active spec/plan directories hold only work in flight.
 - GitHub Actions pinned to full 40-char commit SHAs (never mutable tags/branches). To bump an

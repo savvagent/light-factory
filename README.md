@@ -78,7 +78,7 @@ cargo run -p light-factory-tui             # binary: light-factory
 
 ## Test & lint
 
-CI gates on exactly these three commands — run them before calling a slice done:
+Run all three before calling a slice done (CI runs clippy and the tests; the format check is local):
 
 ```sh
 cargo fmt --check
@@ -119,7 +119,9 @@ Secrets are never committed; set them with `fly secrets set` in production.
   close-out mark the spec `IMPLEMENTED`, tick the plan, and `git mv` both into
   `docs/superpowers/archive/`.
 - GitHub Actions refs pinned to full 40-char commit SHAs.
-- Do not commit unless asked. No attribution / Co-Authored-By anywhere.
+- Interactive sessions do not commit unless asked; development-workflow runs commit on their
+  own branch in a worktree and merge through a PR (`ARCHITECTURE.md` § Conventions). Nothing
+  commits directly to `master`. No attribution / Co-Authored-By anywhere.
 
 ## Documentation
 
